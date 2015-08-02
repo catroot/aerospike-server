@@ -228,7 +228,7 @@ udf_rw_get_ldt_error(void *val, size_t vlen)
 		// we are obviously not looking at an LDT error.
 		if (&charptr[9] < &valptr[vlen]) {
 			if (memcmp(&charptr[5], ":LDT-", 5) == 0) {
-				error_code = strtol(&charptr[1], NULL, 0);
+				error_code = strtol(&charptr[1], NULL, 10);
 				cf_debug(AS_UDF, "LDT Error: Code(%ld) String(%s)",
 						error_code, (char *) val);
 				return error_code;
@@ -341,15 +341,26 @@ udf_rw_update_ldt_err_stats(as_namespace *ns, as_result *res)
 
 			case ERR_FILTER_BAD:
 			case ERR_FILTER_NOT_FOUND:
-			case ERR_KEY_FUN_BAD:
-			case ERR_KEY_FUN_NOT_FOUND:
-			case ERR_TRANS_FUN_BAD:
-			case ERR_TRANS_FUN_NOT_FOUND:
-			case ERR_UNTRANS_FUN_BAD:
-			case ERR_UNTRANS_FUN_NOT_FOUND:
-			case ERR_USER_MODULE_BAD:
-			case ERR_USER_MODULE_NOT_FOUND:
-				cf_atomic_int_incr(&ns->lstats.ldt_err_transform_internal);
+				cf_atomic_int_incr(&ns->lstats.ldt_err_filter);
+				break;
+			case ERR_KEY_BAD:
+			case ERR_KEY_FIELD_NOT_FOUND:
+				cf_atomic_int_incr(&ns->lstats.ldt_err_key);
+				break;
+			case ERR_INPUT_CREATESPEC:
+				cf_atomic_int_incr(&ns->lstats.ldt_err_createspec);
+				break;
+			case ERR_INPUT_USER_MODULE_NOT_FOUND:
+				cf_atomic_int_incr(&ns->lstats.ldt_err_usermodule);
+				break;
+
+			case ERR_INPUT_TOO_LARGE:
+				cf_atomic_int_incr(&ns->lstats.ldt_err_input_too_large);
+				break;
+			case ERR_NS_LDT_NOT_ENABLED:
+				cf_atomic_int_incr(&ns->lstats.ldt_err_ldt_not_enabled);
+				break;
+			
 			default:
 				cf_atomic_int_incr(&ns->lstats.ldt_err_unknown);
 		}
@@ -747,7 +758,7 @@ udf_rw_post_processing(udf_record *urecord, udf_optype *urecord_op, uint16_t set
 		set_id = as_index_get_set_id(r_ref->r);
 	}
 	// Close the record for all the cases
-	udf_record_close(urecord, false);
+	udf_record_close(urecord);
 
 	// Write to XDR pipe after closing the record, in order to release the record lock as
 	// early as possible.
@@ -864,22 +875,30 @@ udf_rw_finish(ldt_record *lrecord, write_request *wr, udf_optype * lrecord_op, u
 			is_ldt = true;
 			subrec_count++;
 			udf_record *c_urecord = &lrecord->chunk[i].slots[j].c_urecord;
-			if (g_config.ldt_benchmarks 
-					&& c_urecord->tr->rsv.ns
-					&& NAMESPACE_HAS_PERSISTENCE(c_urecord->tr->rsv.ns)
-					&& c_urecord->rd) {
-				total_flat_size += as_storage_record_size(c_urecord->rd);
+			if (g_config.ldt_benchmarks) {
+				udf_rw_getop(c_urecord, &urecord_op);
+				if (UDF_OP_IS_WRITE(urecord_op)) {
+					if (c_urecord->tr->rsv.ns
+						&& NAMESPACE_HAS_PERSISTENCE(c_urecord->tr->rsv.ns)
+						&& c_urecord->rd) {
+						total_flat_size += as_storage_record_size(c_urecord->rd);
+					}
+				}
 			}
 			udf_rw_post_processing(c_urecord, &urecord_op, set_id);
 		}
 
 		// Process the parent record in the end .. this is to make sure
 		// the lock is held till the end. 
-		if (g_config.ldt_benchmarks 
-			&& h_urecord->tr->rsv.ns
-			&& NAMESPACE_HAS_PERSISTENCE(h_urecord->tr->rsv.ns)
-			&& h_urecord->rd) {
-			total_flat_size += as_storage_record_size(h_urecord->rd);
+		if (g_config.ldt_benchmarks) {
+			udf_rw_getop(h_urecord, &urecord_op);
+			if (UDF_OP_IS_WRITE(urecord_op)) { 
+				if (h_urecord->tr->rsv.ns
+					&& NAMESPACE_HAS_PERSISTENCE(h_urecord->tr->rsv.ns)
+					&& h_urecord->rd) {
+					total_flat_size += as_storage_record_size(h_urecord->rd);
+				}
+			}
 		}
 		udf_rw_post_processing(h_urecord, &urecord_op, set_id);
 
@@ -1115,6 +1134,8 @@ int udf_rw_addresponse(as_transaction *tr, void *udata)
 int
 udf_rw_local(udf_call * call, write_request *wr, udf_optype *op)
 {
+	*op = UDF_OPTYPE_NONE;
+
 	// Step 1: Setup UDF Record and LDT record
 	as_transaction *tr = call->transaction;
 	as_index_ref    r_ref;
@@ -1163,7 +1184,7 @@ udf_rw_local(udf_call * call, write_request *wr, udf_optype *op)
 		// If both the record and the message have keys, check them.
 		if (rd.key) {
 			if (msg_has_key(m) && ! check_msg_key(m, &rd)) {
-				udf_record_close(&urecord, false);
+				udf_record_close(&urecord);
 				call->transaction->result_code = AS_PROTO_RESULT_FAIL_KEY_MISMATCH;
 				// Necessary to complete transaction, but error string would be
 				// ignored by client, so don't bother sending one.
@@ -1233,7 +1254,7 @@ udf_rw_local(udf_call * call, write_request *wr, udf_optype *op)
 
 		udf_rw_update_ldt_err_stats(ns, res);
 
-		if (UDF_OP_IS_READ(*op)) {
+		if (UDF_OP_IS_READ(*op) || *op == UDF_OPTYPE_NONE) {
 			send_result(res, call, NULL);
 			as_result_destroy(res);
 		} else {
@@ -1250,7 +1271,7 @@ udf_rw_local(udf_call * call, write_request *wr, udf_optype *op)
 		}
 
 	} else {
-		udf_record_close(&urecord, false);
+		udf_record_close(&urecord);
 		char *rs = as_module_err_string(ret_value);
 		call->transaction->result_code = AS_PROTO_RESULT_FAIL_UDF_EXECUTION;
 		send_response(call, "FAILURE", 7, AS_PARTICLE_TYPE_STRING, rs, strlen(rs));

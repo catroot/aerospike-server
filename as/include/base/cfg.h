@@ -114,7 +114,7 @@ typedef struct as_config_s {
 	uint32_t			query_bufpool_size;
 	uint32_t			query_short_q_max_size;
 	uint32_t			query_long_q_max_size;
-	uint32_t			query_untracked_time;
+	uint32_t			query_untracked_time_ns;
 
 	int					n_transaction_queues;
 	int					n_transaction_threads_per_queue;
@@ -130,8 +130,17 @@ typedef struct as_config_s {
 	/* after this many milliseconds, connections are aborted unless transaction is in progress */
 	int					proto_fd_idle_ms;
 
+	/* sleep this many millisecond before retrying for all the blocked query */
+	int					proto_slow_netio_sleep_ms;
+
 	/* The TCP port for the fabric */
 	int					fabric_port;
+
+	/* Fabric TCP socket keepalive parameters */
+	bool				fabric_keepalive_enabled;
+	int					fabric_keepalive_time;
+	int					fabric_keepalive_intvl;
+	int					fabric_keepalive_probes;
 
 	/* The TCP port for the info socket */
 	int					info_port;
@@ -273,6 +282,7 @@ typedef struct as_config_s {
 
 	// Temporary dangling prole garbage collection.
 	uint32_t			prole_extra_ttl;	// seconds beyond expiry time after which we garbage collect, 0 for no garbage collection
+	bool				non_master_sets_delete;	// locally delete non-master records in sets that are being emptied
 
 	xdr_config			xdr_cfg;							// XDR related config parameters
 	xdr_lastship_s		xdr_lastship[AS_CLUSTER_SZ];		// last XDR shipping info of other nodes
@@ -300,6 +310,8 @@ typedef struct as_config_s {
 	histogram      *_sindex_gc_pimd_rlock_hist;   // HIstogram to track time spent under pimd rlock by sindex GC
 	histogram      *_sindex_gc_pimd_wlock_hist;   // Histogram to track time spent under pimd wlock by sindex GC
 
+	bool                qnodes_pre_reserved;      // If true we will reserve all the qnodes upfront 
+												  // before processing query. Default - TRUE
 	cf_atomic64			query_reqs;
 	cf_atomic64			query_fail;
 	cf_atomic64			query_short_queue_full;

@@ -76,16 +76,19 @@
 #include "base/thr_sindex.h"
 #include "base/ldt.h"
 
-#define STR_NS             "ns"
-#define STR_SET            "set"
-#define STR_INDEXNAME      "indexname"
-#define STR_NUMBIN         "numbins"
-#define STR_INDEXDATA      "indexdata"
-#define STR_TYPE_NUMERIC   "numeric"
-#define STR_TYPE_STRING    "string"
-#define STR_ITYPE          "indextype"
-#define STR_ITYPE_OBJECT   "object"
-#define STR_BINTYPE        "bintype"
+#define STR_NS              "ns"
+#define STR_SET             "set"
+#define STR_INDEXNAME       "indexname"
+#define STR_NUMBIN          "numbins"
+#define STR_INDEXDATA       "indexdata"
+#define STR_TYPE_NUMERIC    "numeric"
+#define STR_TYPE_STRING     "string"
+#define STR_ITYPE           "indextype"
+#define STR_ITYPE_DEFAULT   "DEFAULT"
+#define STR_ITYPE_LIST      "LIST"
+#define STR_ITYPE_MAPKEYS   "MAPKEYS"
+#define STR_ITYPE_MAPVALUES "MAPVALUES"
+#define STR_BINTYPE         "bintype"
 
 extern int as_nsup_queue_get_size();
 
@@ -638,7 +641,7 @@ info_get_stats(char *name, cf_dyn_buf *db)
 
 	cf_dyn_buf_append_string(db, ";sindex_ucgarbage_found=");
 	APPEND_STAT_COUNTER(db, g_config.query_false_positives);
-	
+
 	cf_dyn_buf_append_string(db, ";sindex_gc_locktimedout=");
 	APPEND_STAT_COUNTER(db, g_config.sindex_gc_timedout);
 
@@ -653,7 +656,7 @@ info_get_stats(char *name, cf_dyn_buf *db)
 
 	cf_dyn_buf_append_string(db, ";sindex_gc_list_deletion_time=");
 	APPEND_STAT_COUNTER(db, g_config.sindex_gc_list_deletion_time);
-	
+
 	cf_dyn_buf_append_string(db, ";sindex_gc_objects_validated=");
 	APPEND_STAT_COUNTER(db, g_config.sindex_gc_objects_validated);
 
@@ -790,6 +793,14 @@ int
 info_get_replicas_master(char *name, cf_dyn_buf *db)
 {
 	as_partition_getreplica_master_str(db);
+
+	return(0);
+}
+
+int
+info_get_replicas_all(char *name, cf_dyn_buf *db)
+{
+	as_partition_get_replicas_all_str(db);
 
 	return(0);
 }
@@ -1592,6 +1603,60 @@ info_command_jem_stats(char *name, char *params, cf_dyn_buf *db)
 }
 
 int
+info_command_double_free(char *name, char *params, cf_dyn_buf *db)
+{
+	cf_debug(AS_INFO, "df command received: params %s", params);
+
+#ifdef USE_DF_DETECT
+	/*
+	 *  Purpose:         Do an intentional double "free()" to test Double "free()" Detection.
+	 *
+	 *  Command Format:  "df:"
+	 *
+	 *  This command operates in a 3-cycle to trigger a double "free()" condition:
+	 *
+	 *  - Executing this command the first time will dynamically allocate a small block of memory.
+	 *
+	 *  - Executing this command the second time will free the block.
+	 *
+	 *  - Executing it a third time will actually perform the double "free()" and should trigger
+	 *       the double "free()" detector, which will log an informative warning message.
+	 *
+	 *  - Executing it thereafter will repeat the 3-cycle, albeit using a different pseudo-random block size.
+	 *
+	 *  ***Warning***:  This command is provided *only* for testing abnormal situations.
+	 *                  Do not use it unless you are prepared for the potential consequences!
+	 */
+
+	static size_t block_sz = 1024, incr = 255, max = 2048;
+	static char *ptr = 0;
+	static int ctr = 0;
+
+	if (!ptr) {
+		cf_dyn_buf_append_string(db, "calling cf_""malloc(");
+		cf_dyn_buf_append_int(db, block_sz);
+		cf_dyn_buf_append_string(db, ")");
+		ptr = cf_malloc(block_sz);
+	} else {
+		cf_dyn_buf_append_string(db, "calling cf_""free(0x");
+		cf_dyn_buf_append_uint64_x(db, (uint64_t) ptr);
+		cf_dyn_buf_append_string(db, ")");
+		cf_free(ptr);
+		if (ctr++) {
+			ctr = 0;
+			ptr = 0;
+			block_sz = (block_sz + incr) % max;
+		}
+	}
+#else
+	cf_warning(AS_INFO, "Double \"free()\" Detection support is not compiled into build ~~ rebuild with \"USE_DF_DETECT=1\" to use");
+	cf_dyn_buf_append_string(db, "error");
+#endif
+
+	return 0;
+}
+
+int
 info_command_asm(char *name, char *params, cf_dyn_buf *db)
 {
 	cf_debug(AS_INFO, "asm command received: params %s", params);
@@ -1828,7 +1893,7 @@ info_command_smd_cmd(char *name, char *params, cf_dyn_buf *db)
 				cf_dyn_buf_append_string(db, "error");
 				return 0;
 			}
-		} 
+		}
 	}
 
 	if (!strcmp(cmd, "set") || !strcmp(cmd, "delete") || !strcmp(cmd, "get")) {
@@ -1862,49 +1927,93 @@ info_command_mon_cmd(char *name, char *params, cf_dyn_buf *db)
 
 	/* Command format : "jobs:[module=<string>;cmd=<command>;<parameters]"
 	*                   asinfo -v 'jobs'              -> list all jobs
-	*                   asinfo -v 'jobs:module=query" -> list all jobs for query module
-	*                   asinfo -v 'jobs:module=query;cmd=kill;trid=<trid>
-	*                   asinfo -v 'jobs:module=query;cmd=setpriority;trid=<trid>;value=<val>
+	*                   asinfo -v 'jobs:module=query' -> list all jobs for query module
+	*                   asinfo -v 'jobs:module=query;cmd=kill-job;trid=<trid>'
+	*                   asinfo -v 'jobs:module=query;cmd=set-priority;trid=<trid>;value=<val>'
 	* where <module> is one of following :
 	* 		- query
 	* 		- scan
-	* 		- demo
 	*/
 
-	char cmd[11];
+	char cmd[13];
 	char module[21];
 	char job_id[24];
-	char val_str[24];
+	char val_str[11];
 	int cmd_len       = sizeof(cmd);
 	int module_len    = sizeof(module);
 	int job_id_len    = sizeof(job_id);
 	int val_len       = sizeof(val_str);
 	uint64_t trid     = 0;
-	uint64_t value    = ULONG_MAX;
+	uint32_t value    = 0;
 
 	cmd[0]     = '\0';
 	module[0]  = '\0';
 	job_id[0]  = '\0';
 	val_str[0] = '\0';
 
-	// read cmd module trid value
-	if (as_info_parameter_get(params, "module", module, &module_len)) {
+	// Read the parameters: module cmd trid value
+	int rv = as_info_parameter_get(params, "module", module, &module_len);
+	if (rv == -1) {
 		as_mon_info_cmd(NULL, NULL, 0, 0, db);
 		return 0;
 	}
-
-	if (as_info_parameter_get(params, "cmd", cmd, &cmd_len)) {
-		as_mon_info_cmd(module, NULL, 0, 0, db);
-	} else {
-		if (0 == as_info_parameter_get(params, "trid", job_id, &job_id_len)) {
-			trid  = strtoull(job_id, NULL, 10);
-		}
-		if (0 == as_info_parameter_get(params, "value", val_str, &val_len)) {
-			value = strtoull(val_str, NULL, 10);
-		}
-		cf_info(AS_SCAN, "%s %s %ld %ld", module, cmd, trid, value);
-		as_mon_info_cmd(module, cmd, trid, value, db);
+	else if (rv == -2) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_PARAMETER);
+		cf_dyn_buf_append_string(db, ":\"module\" parameter too long (> ");
+		cf_dyn_buf_append_int(db, module_len-1);
+		cf_dyn_buf_append_string(db, " chars)");
+		return 0;
 	}
+
+	rv = as_info_parameter_get(params, "cmd", cmd, &cmd_len);
+	if (rv == -1) {
+		as_mon_info_cmd(module, NULL, 0, 0, db);
+		return 0;
+	}
+	else if (rv == -2) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_PARAMETER);
+		cf_dyn_buf_append_string(db, ":\"cmd\" parameter too long (> ");
+		cf_dyn_buf_append_int(db, cmd_len-1);
+		cf_dyn_buf_append_string(db, " chars)");
+		return 0;
+	}
+
+	rv = as_info_parameter_get(params, "trid", job_id, &job_id_len);
+	if (rv == 0) {
+		trid  = strtoull(job_id, NULL, 10);
+	}
+	else if (rv == -1) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_PARAMETER);
+		cf_dyn_buf_append_string(db, ":no \"trid\" parameter specified");
+		return 0;
+	}
+	else if (rv == -2) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_PARAMETER);
+		cf_dyn_buf_append_string(db, ":\"trid\" parameter too long (> ");
+		cf_dyn_buf_append_int(db, job_id_len-1);
+		cf_dyn_buf_append_string(db, " chars)");
+		return 0;
+	}
+
+	rv = as_info_parameter_get(params, "value", val_str, &val_len);
+	if (rv == 0) {
+		value = strtoul(val_str, NULL, 10);
+	}
+	else if (rv == -2) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_PARAMETER);
+		cf_dyn_buf_append_string(db, ":\"value\" parameter too long (> ");
+		cf_dyn_buf_append_int(db, val_len-1);
+		cf_dyn_buf_append_string(db, " chars)");
+		return 0;
+	}
+
+	cf_info(AS_SCAN, "%s %s %lu %u", module, cmd, trid, value);
+	as_mon_info_cmd(module, cmd, trid, value, db);
 	return 0;
 }
 
@@ -1943,6 +2052,8 @@ info_service_config_get(cf_dyn_buf *db)
 	cf_dyn_buf_append_int(db, g_config.n_proto_fd_max);
 	cf_dyn_buf_append_string(db, ";proto-fd-idle-ms=");
 	cf_dyn_buf_append_int(db, g_config.proto_fd_idle_ms);
+	cf_dyn_buf_append_string(db, ";proto-slow-netio-sleep-ms=");
+	cf_dyn_buf_append_int(db, g_config.proto_slow_netio_sleep_ms);
 	cf_dyn_buf_append_string(db, ";transaction-retry-ms=");
 	cf_dyn_buf_append_int(db, g_config.transaction_retry_ms);
 	cf_dyn_buf_append_string(db, ";transaction-max-ms=");
@@ -2089,7 +2200,7 @@ info_service_config_get(cf_dyn_buf *db)
 	cf_dyn_buf_append_string(db, ";query-threshold=");
 	cf_dyn_buf_append_uint64(db, g_config.query_threshold);
 	cf_dyn_buf_append_string(db, ";query-untracked-time=");
-	cf_dyn_buf_append_uint64(db, g_config.query_untracked_time/1000); // Show it in micro seconds
+	cf_dyn_buf_append_uint64(db, g_config.query_untracked_time_ns/1000); // Show it in micro seconds
 
 	return(0);
 }
@@ -2151,6 +2262,9 @@ info_namespace_config_get(char* context, cf_dyn_buf *db)
 	cf_dyn_buf_append_string(db, ";ldt-enabled=");
 	cf_dyn_buf_append_string(db, ns->ldt_enabled ? "true" : "false");
 
+	cf_dyn_buf_append_string(db, ";ldt-page-size=");
+	cf_dyn_buf_append_uint64(db, ns->ldt_page_size);
+
 	cf_dyn_buf_append_string(db, ";enable-xdr=");
 	cf_dyn_buf_append_string(db, ns->enable_xdr ? "true" : "false");
 
@@ -2159,6 +2273,12 @@ info_namespace_config_get(char* context, cf_dyn_buf *db)
 
 	cf_dyn_buf_append_string(db, ";ns-forward-xdr-writes=");
 	cf_dyn_buf_append_string(db, ns->ns_forward_xdr_writes ? "true" : "false");
+
+	cf_dyn_buf_append_string(db, ";allow-nonxdr-writes=");
+	cf_dyn_buf_append_string(db, ns->ns_allow_nonxdr_writes ? "true" : "false");
+
+	cf_dyn_buf_append_string(db, ";allow-xdr-writes=");
+	cf_dyn_buf_append_string(db, ns->ns_allow_xdr_writes ? "true" : "false");
 
 	cf_dyn_buf_append_string(db, ";disallow-null-setname=");
 	cf_dyn_buf_append_string(db, ns->disallow_null_setname ? "true" : "false");
@@ -2285,6 +2405,16 @@ info_network_info_config_get(cf_dyn_buf *db)
 	cf_dyn_buf_append_string(db, g_config.socket_reuse_addr ? "true" : "false");
 	cf_dyn_buf_append_string(db, ";fabric-port=");
 	cf_dyn_buf_append_int(db, g_config.fabric_port);
+
+	cf_dyn_buf_append_string(db, ";fabric-keepalive-enabled=");
+	cf_dyn_buf_append_string(db, g_config.fabric_keepalive_enabled ? "true" : "false");
+	cf_dyn_buf_append_string(db, ";fabric-keepalive-time=");
+	cf_dyn_buf_append_int(db, g_config.fabric_keepalive_time);
+	cf_dyn_buf_append_string(db, ";fabric-keepalive-intvl=");
+	cf_dyn_buf_append_int(db, g_config.fabric_keepalive_intvl);
+	cf_dyn_buf_append_string(db, ";fabric-keepalive-probes=");
+	cf_dyn_buf_append_int(db, g_config.fabric_keepalive_probes);
+
 // network-info-port is the asd info port variable/output, This was chosen because info-port conflicts with XDR config parameter.
 // Ideally XDR should use xdr-info-port and asd should use info-port.
 	cf_dyn_buf_append_string(db, ";network-info-port=");
@@ -2351,12 +2481,14 @@ info_security_config_get(cf_dyn_buf *db)
 void
 info_xdr_config_get(cf_dyn_buf *db)
 {
-	cf_dyn_buf_append_string(db, "xdr-delete-shipping-enabled=");
+	cf_dyn_buf_append_string(db, "enable-xdr=");
+	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_global_enabled ? "true" : "false");
+	cf_dyn_buf_append_string(db, ";forward-xdr-writes=");
+	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_forward_xdrwrites ? "true" : "false");
+	cf_dyn_buf_append_string(db, ";xdr-delete-shipping-enabled=");
 	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_delete_shipping_enabled ? "true" : "false");
 	cf_dyn_buf_append_string(db, ";xdr-nsup-deletes-enabled=");
 	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_nsup_deletes_enabled ? "true" : "false");
-	cf_dyn_buf_append_string(db, ";enable-xdr=");
-	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_global_enabled ? "true" : "false");
 	cf_dyn_buf_append_string(db, ";stop-writes-noxdr=");
 	cf_dyn_buf_append_string(db, g_config.xdr_cfg.xdr_stop_writes_noxdr ? "true" : "false");
 }
@@ -2598,6 +2730,12 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 			cf_info(AS_INFO, "Changing value of proto-fd-idle-ms from %d to %d ", g_config.proto_fd_idle_ms, val);
 			g_config.proto_fd_idle_ms = val;
 		}
+		else if (0 == as_info_parameter_get(params, "proto-slow-netio-sleep-ms", context, &context_len)) {
+			if (0 != cf_str_atoi(context, &val))
+				goto Error;
+			cf_info(AS_INFO, "Changing value of proto-slow-netio-sleep-ms from %d to %d ", g_config.proto_slow_netio_sleep_ms, val);
+			g_config.proto_slow_netio_sleep_ms = val;
+		}
 		else if (0 == as_info_parameter_get(params, "nsup-delete-sleep", context, &context_len)) {
 			if (0 != cf_str_atoi(context, &val))
 				goto Error;
@@ -2808,6 +2946,18 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 			else
 				goto Error;
 		}
+		else if (0 == as_info_parameter_get(params, "non-master-sets-delete", context, &context_len)) {
+			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
+				cf_info(AS_INFO, "Changing value of non-master-sets-delete from %s to %s", bool_val[g_config.non_master_sets_delete], context);
+				g_config.non_master_sets_delete = true;
+			}
+			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
+				cf_info(AS_INFO, "Changing value of non-master-sets-delete from %s to %s", bool_val[g_config.non_master_sets_delete], context);
+				g_config.non_master_sets_delete = false;
+			}
+			else
+				goto Error;
+		}
 		else if (0 == as_info_parameter_get(params, "prole-extra-ttl", context, &context_len)) {
 			if (0 != cf_str_atoi(context, &val)) {
 				goto Error;
@@ -2883,9 +3033,9 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 			if (val < 0) {
 				goto Error;
 			}
-			cf_info(AS_INFO, "Changing value of query-untracked-time from %"PRIu64" micro seconds to %"PRIu64" micro seconds", 
-						g_config.query_untracked_time/1000, val);
-			g_config.query_untracked_time = val * 1000;
+			cf_info(AS_INFO, "Changing value of query-untracked-time from %"PRIu64" micro seconds to %"PRIu64" micro seconds",
+						g_config.query_untracked_time_ns/1000, val);
+			g_config.query_untracked_time_ns = val * 1000;
 		}
 		else if (0 == as_info_parameter_get(params, "query-rec-count-bound", context, &context_len)) {
 			uint64_t val = atoll(context);
@@ -3067,14 +3217,27 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 			}
 		}
 		else if (0 == as_info_parameter_get(params, "query-microbenchmark", context, &context_len)) {
-			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) { 
+			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
 				cf_info(AS_INFO, "Changing value of query-enable-histogram to %s", context);
 				g_config.query_enable_histogram = true;
-			}    
-			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) { 
+			}
+			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
 				cf_info(AS_INFO, "Changing value of query-enable-histogram to %s", context);
 				g_config.query_enable_histogram = false;
-			}    
+			}
+			else {
+				goto Error;
+			}
+		}
+		else if (0 == as_info_parameter_get(params, "pre-reserve-qnodes", context, &context_len)) {
+			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
+				cf_info(AS_INFO, "Changing value of reserve-qnodes-upfront to %s", context);
+				g_config.qnodes_pre_reserved = true;
+			}
+			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
+				cf_info(AS_INFO, "Changing value of reserve-qnodes-upfront to %s", context);
+				g_config.qnodes_pre_reserved = false;
+			}
 			else {
 				goto Error;
 			}
@@ -3288,6 +3451,17 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 				goto Error;
 			}
 		}
+		else if (0 == as_info_parameter_get(params, "ldt-page-size", context, &context_len)) {
+			if (0 != cf_str_atoi(context, &val)) {
+				goto Error;
+			}
+	  		if (val > ns->storage_write_block_size) {
+				// 1Kb head room
+				val = ns->storage_write_block_size - 1024;
+			}
+			cf_info(AS_INFO, "Changing value of ldt-page-size of ns %s from %d to %d ", ns->name, ns->ldt_page_size, val);
+			ns->ldt_page_size = val;
+		}
 		else if (0 == as_info_parameter_get(params, "ldt-gc-rate", context, &context_len)) {
 			if (0 != cf_str_atoi(context, &val)) {
 				goto Error;
@@ -3305,8 +3479,15 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 				goto Error;
 			}
 			cf_info(AS_INFO, "Changing value of defrag-lwm-pct of ns %s from %d to %d ", ns->name, ns->storage_defrag_lwm_pct, val);
+
+			uint32_t old_val = ns->storage_defrag_lwm_pct;
+
 			ns->storage_defrag_lwm_pct = val;
 			ns->defrag_lwm_size = (ns->storage_write_block_size * ns->storage_defrag_lwm_pct) / 100;
+
+			if (ns->storage_defrag_lwm_pct > old_val) {
+				as_storage_defrag_sweep(ns);
+			}
 		}
 		else if (0 == as_info_parameter_get(params, "defrag-queue-min", context, &context_len)) {
 			if (0 != cf_str_atoi(context, &val)) {
@@ -3362,14 +3543,40 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 				goto Error;
 			}
 		}
-		else if (0 == as_info_parameter_get(params, "forward-xdr-writes", context, &context_len)) {
+		else if (0 == as_info_parameter_get(params, "ns-forward-xdr-writes", context, &context_len)) {
 			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
-				cf_info(AS_INFO, "Changing value of sets-enable-xdr of ns %s from %s to %s", ns->name, bool_val[ns->ns_forward_xdr_writes], context);
+				cf_info(AS_INFO, "Changing value of ns-forward-xdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_forward_xdr_writes], context);
 				ns->ns_forward_xdr_writes = true;
 			}
 			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
-				cf_info(AS_INFO, "Changing value of sets-enable-xdr of ns %s from %s to %s", ns->name, bool_val[ns->ns_forward_xdr_writes], context);
+				cf_info(AS_INFO, "Changing value of ns-forward-xdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_forward_xdr_writes], context);
 				ns->ns_forward_xdr_writes = false;
+			}
+			else {
+				goto Error;
+			}
+		}
+		else if (0 == as_info_parameter_get(params, "allow-nonxdr-writes", context, &context_len)) {
+			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
+				cf_info(AS_INFO, "Changing value of allow-nonxdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_allow_nonxdr_writes], context);
+				ns->ns_allow_nonxdr_writes = true;
+			}
+			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
+				cf_info(AS_INFO, "Changing value of allow-nonxdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_allow_nonxdr_writes], context);
+				ns->ns_allow_nonxdr_writes = false;
+			}
+			else {
+				goto Error;
+			}
+		}
+		else if (0 == as_info_parameter_get(params, "allow-xdr-writes", context, &context_len)) {
+			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
+				cf_info(AS_INFO, "Changing value of allow-xdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_allow_xdr_writes], context);
+				ns->ns_allow_xdr_writes = true;
+			}
+			else if (strncmp(context, "false", 5) == 0 || strncmp(context, "no", 2) == 0) {
+				cf_info(AS_INFO, "Changing value of allow-xdr-writes of ns %s from %s to %s", ns->name, bool_val[ns->ns_allow_xdr_writes], context);
+				ns->ns_allow_xdr_writes = false;
 			}
 			else {
 				goto Error;
@@ -3603,6 +3810,10 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 			cf_node nodeid = atoll(context);
 			xdr_handle_failednodeprocessingdone(nodeid);
 		}
+		else if (0 == as_info_parameter_get(params, "xdr-namedpipe-path", context, &context_len)) {
+			g_config.xdr_cfg.xdr_digestpipe_path = cf_strdup(context);
+			cf_info(AS_INFO, "xdr-namedpipe-path set to : %s", context);
+		}
 		else if (0 == as_info_parameter_get(params, "stop-writes-noxdr", context, &context_len)) {
 			if (strncmp(context, "true", 4) == 0 || strncmp(context, "yes", 3) == 0) {
 				cf_info(AS_INFO, "Changing value of stop-writes-noxdr from %s to %s", bool_val[g_config.xdr_cfg.xdr_stop_writes_noxdr], context);
@@ -3653,6 +3864,7 @@ info_command_config_set(char *name, char *params, cf_dyn_buf *db)
 	else
 		goto Error;
 
+	cf_info(AS_INFO, "config-set command completed: params %s",params);
 	cf_dyn_buf_append_string(db, "ok");
 	return(0);
 
@@ -3918,8 +4130,6 @@ info_command_hist_track(char *name, char *params, cf_dyn_buf *db)
 		cf_hist_track_get_info(g_config.q_hist, back_sec, duration_sec, slice_sec, throughput_only, CF_HIST_TRACK_FMT_PACKED, db);
 	}
 
-	cf_info(AS_INFO, "hist track %s command executed: params %s", name, params);
-
 	return 0;
 }
 
@@ -4107,7 +4317,12 @@ info_some(char *buf, char *buf_lim, const as_file_handle* fd_h, cf_dyn_buf *db)
 
 			// parse parameters
 			tok = c + 1;
-			while (*c != EOL) c++;
+			// make sure c doesn't go beyond buf_lim
+			while (*c != EOL && c < buf_lim-1) c++;
+			if (*c != EOL) {
+				cf_warning(AS_INFO, "Info '%s' parameter not terminated with '\\n'.", name);
+				break;
+			}
 			*c = 0;
 			char *param = tok;
 
@@ -4501,13 +4716,14 @@ as_info_set_buf(const char *name, const uint8_t *value, size_t value_sz, bool de
 // cmd:param=value;param=value
 //
 // The main parser gives us the entire parameter string
-// so use this function to scan through and get the parameter parameter value
+// so use this function to scan through and get the particular parameter value
 // you're looking for
 //
 // The 'param_string' is the param passed by the command parser into a command
 //
-// @return -1 : NUll param name
-//         -2 : param name out of bounds ..
+// @return  0 : success
+//         -1 : parameter not found
+//         -2 : parameter found but value is too long
 //
 
 int
@@ -4526,7 +4742,7 @@ as_info_parameter_get(char *param_str, char *param, char *value, int *value_len)
 				tok = c;
 				while ( *c != 0 && *c != ';') c++;
 				if (*value_len <= c - tok)	{
-					// This handles the case of set name out of bounds.
+					// The found value is too long.
 					return(-2);
 				}
 				*value_len = c - tok;
@@ -4978,7 +5194,7 @@ build_service_list(cf_ifaddr * ifaddr, int ifaddr_sz, cf_dyn_buf *db) {
 			cf_dyn_buf_append_char(db, ';');
 		}
 	}
-	
+
 	// take off the last ';' if there was any string there
 	if (db->used_sz > 0)
 		cf_dyn_buf_chomp(db);
@@ -5016,7 +5232,7 @@ info_interfaces_fn(void *gcc_is_ass)
 					break;
 				}
 			}
-		} else { 
+		} else {
 			changed = true;
 		}
 
@@ -5059,7 +5275,7 @@ info_interfaces_static_fn(void *gcc_is_ass)
 
 	cf_info(AS_INFO, " static external network definition ");
 
-	// check external-address is matching with given addresses in service list 
+	// check external-address is matching with given addresses in service list
 	uint8_t buf[512];
 	cf_ifaddr *ifaddr;
 	int	ifaddr_sz;
@@ -5077,7 +5293,7 @@ info_interfaces_static_fn(void *gcc_is_ass)
 	cf_dyn_buf_free(&temp_service_db);
 	cf_free(service_str);
 
-	// For valid external-address specify the same in service-list 
+	// For valid external-address specify the same in service-list
 	cf_dyn_buf_define(service_db);
 	cf_dyn_buf_append_string(&service_db, g_config.external_address);
 	cf_dyn_buf_append_char(&service_db, ':');
@@ -5419,7 +5635,6 @@ info_get_services_reduce_fn(void *key, void *data, void *udata)
 int
 info_get_services(char *name, cf_dyn_buf *db)
 {
-
 	shash_reduce(g_info_node_info_hash, info_get_services_reduce_fn, (void *) db);
 
 	cf_dyn_buf_chomp(db);
@@ -5556,7 +5771,7 @@ info_get_namespace_info(as_namespace *ns, cf_dyn_buf *db)
 
 	// total used memory =  data memory + primary index memory + secondary index memory
 	data_memory   = ns->n_bytes_memory;
-	pindex_memory = as_index_size_get(ns) * ns->n_objects;
+	pindex_memory = as_index_size_get(ns) * (ns->n_objects + ns->n_sub_objects);
 	sindex_memory = cf_atomic_int_get(ns->sindex_data_memory_used);
 	used_memory   = data_memory + pindex_memory + sindex_memory;
 
@@ -5589,7 +5804,7 @@ info_get_namespace_info(as_namespace *ns, cf_dyn_buf *db)
 	// LDT operational statistics
 	//
 	// print only if LDT is enabled
-	if (ns->ldt_enabled) {	
+	if (ns->ldt_enabled) {
 		cf_dyn_buf_append_string(db, ";ldt-reads=");
 		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_read_reqs));
 		cf_dyn_buf_append_string(db, ";ldt-read-success=");
@@ -5658,8 +5873,20 @@ info_get_namespace_info(as_namespace *ns, cf_dyn_buf *db)
 		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_toprec_internal));
 		cf_dyn_buf_append_string(db, ";ldt-err-subrec-internal=");
 		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_subrec_internal));
-		cf_dyn_buf_append_string(db, ";ldt-err-transform-internal=");
-		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_transform_internal));
+
+		cf_dyn_buf_append_string(db, ";ldt-err-filer=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_filter));
+		cf_dyn_buf_append_string(db, ";ldt-err-key=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_key));
+		cf_dyn_buf_append_string(db, ";ldt-err-createspec=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_createspec));
+		cf_dyn_buf_append_string(db, ";ldt-err-usermodule=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_usermodule));
+		cf_dyn_buf_append_string(db, ";ldt-err-input-too-large=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_input_too_large));
+		cf_dyn_buf_append_string(db, ";ldt-err-ldt-not-enabled=");
+		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_ldt_not_enabled));
+
 		cf_dyn_buf_append_string(db, ";ldt-err-unknown=");
 		cf_dyn_buf_append_uint32(db, cf_atomic_int_get(ns->lstats.ldt_err_unknown));
 	}
@@ -6110,9 +6337,8 @@ as_info_parse_params_to_sindex_imd(char* params, as_sindex_metadata *imd, cf_dyn
 		return 0;
 	}
 
-	// ONLY FOR CREATE AFTER THIS POINT
-
-	// INDEXTYPE INDEXTYPE INDEXTYPE
+	// Get the index type.
+	// It could be list, mapkeys, mapvalues, or by default none.
 	char indextype_str[128];
 	memset(indextype_str, 0, 128);
 	int  indtype_len = sizeof(indextype_str);
@@ -6121,135 +6347,119 @@ as_info_parse_params_to_sindex_imd(char* params, as_sindex_metadata *imd, cf_dyn
 		imd->itype = AS_SINDEX_ITYPE_DEFAULT;
 	}
 	else {
-		if (strncmp(indextype_str, STR_ITYPE_OBJECT, 6) == 0) {
-			imd->itype = AS_SINDEX_ITYPE_OBJECT;
-		} else if (strncmp(indextype_str, "default", 8) == 0) {
+		if (strncasecmp(indextype_str, STR_ITYPE_DEFAULT, 7) == 0) {
 			imd->itype = AS_SINDEX_ITYPE_DEFAULT;
-		} else {
+		}
+		else if (strncasecmp(indextype_str, STR_ITYPE_LIST, 4) == 0) {
+			imd->itype = AS_SINDEX_ITYPE_LIST;
+		}
+		else if (strncasecmp(indextype_str, STR_ITYPE_MAPKEYS, 7) == 0) {
+			imd->itype = AS_SINDEX_ITYPE_MAPKEYS;
+		}
+		else if (strncasecmp(indextype_str, STR_ITYPE_MAPVALUES, 9) == 0) {
+			imd->itype = AS_SINDEX_ITYPE_MAPVALUES;
+		}
+		else {
 			cf_warning(AS_INFO, "Failed to create secondary index : invalid type of index"
-					" for sindex creation %s ", indexname_str);
+					" for sindex creation %s %s", indexname_str, indextype_str);
 			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-					"Invalid type must be [functional, userland, default]");
+					"Invalid type must be [none, list, mapkeys, mapvalues]");
 			return AS_SINDEX_ERR_PARAM;
 		}
 	}
 
-	if (imd->itype == AS_SINDEX_ITYPE_OBJECT) { //printf("OBJECT INDEX\n");
-		cf_info(AS_INFO, "Falied to create secondary index : Unsupported Index Type "
-				"(AS_SINDEX_ITYPE_OBJECT) for sindex creation %s", indexname_str);
+	// Gather indexdata
+	char indexdata_str[1024];
+	int  indexdata_len = sizeof(indexdata_str);
+	if (as_info_parameter_get(params, STR_INDEXDATA, indexdata_str,
+				&indexdata_len)) {
+		cf_warning(AS_INFO, "Failed to create secondary index : invalid indexdata for"
+				" sindex creation %s %s", indexname_str, indexdata_str);
 		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-				"Unsupported Index Type");
+				"Invalid indexdata");
 		return AS_SINDEX_ERR_PARAM;
+	}
+	// Read indexdata
+	cf_vector *str_v = cf_vector_create(sizeof(void *), 10, VECTOR_FLAG_INITZERO);
+	cf_str_split(",", indexdata_str, str_v);
+	if (0 != (cf_vector_size(str_v) % 2) || AS_SINDEX_BINMAX < (cf_vector_size(str_v) / 2)) {
+		cf_warning(AS_INFO, "Failed to create secondary index : number of bins more than"
+				"  %d for sindex creation %s", AS_SINDEX_BINMAX, indexname_str);
+		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
+				"invalid indexdata");
+		cf_vector_destroy(str_v);
+		return AS_SINDEX_ERR_PARAM;
+	}
 
-		// TODO: Object Indexes
-		imd->num_bins = 1;
-		char btype_str[1024];
-		int  btype_len = sizeof(btype_str);
-		if (as_info_parameter_get(params, STR_BINTYPE, btype_str, &btype_len)) {
-			cf_warning(AS_INFO, "Failed to create secondary index : invalid bintype for "
-					"secondary index creation %s ", indexname_str);
+	// Bin data
+	// TODO: Remove the half cooked multi-col index support from server.
+	int bincount = 0;
+	for (int i = 0; i < (cf_vector_size(str_v) / 2); i++) {
+		// Not more than AS_SINDEX_BINMAX are allowed
+		if (bincount >= AS_SINDEX_BINMAX) {
+			cf_warning(AS_INFO, "Failed to create secondary index: More bins are specified "
+					"than %d for sindex creation %s ", AS_SINDEX_BINMAX, indexname_str);
 			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-					"Invalid bintype");
-			return AS_SINDEX_ERR_PARAM;
-		}
-		if        (strncasecmp(btype_str, "string", 6) == 0) {
-			imd->btype[0] = AS_SINDEX_KTYPE_DIGEST;
-		} else if (strncasecmp(btype_str, "numeric", 7) == 0) {
-			imd->btype[0] = AS_SINDEX_KTYPE_LONG;
-		} else {
-			cf_warning(AS_INFO, "Failed to create secondary index: bin type (%s) "
-					"not supported for sindex creation %s", btype_str, indexname_str);
-			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-					"Invalid bintype");
-			return AS_SINDEX_ERR_PARAM;
-		}
-		char obj_cname[1024];
-		sprintf(obj_cname, "INDEX:%s", imd->iname);
-		imd->bnames[0] = cf_strdup(obj_cname);
-		imd->oindx     = 1;
-	} else {
-
-		// BINNAME / TYPE ... BINNAME / TYPE .. BINNAME / TYPE
-		char indexdata_str[1024];
-		int  indexdata_len = sizeof(indexdata_str);
-		if (as_info_parameter_get(params, STR_INDEXDATA, indexdata_str,
-					&indexdata_len)) {
-			cf_warning(AS_INFO, "Failed to create secondary index : invalid indexdata for"
-					" sindex creation %s", indexname_str);
-			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-					"Invalid indexdata");
-			return AS_SINDEX_ERR_PARAM;
-		}
-		cf_vector *str_v = cf_vector_create(sizeof(void *), 10,
-				VECTOR_FLAG_INITZERO);
-		cf_str_split(",", indexdata_str, str_v);
-		if (0 != (cf_vector_size(str_v) % 2) ||
-				AS_SINDEX_BINMAX < (cf_vector_size(str_v) / 2)) {
-			cf_warning(AS_INFO, "Failed to create secondary index : number of bins more than"
-					"  %d for sindex creation %s", AS_SINDEX_BINMAX, indexname_str);
-			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-					"invalid indexdata");
+					"More bins specified than allowed");
 			cf_vector_destroy(str_v);
 			return AS_SINDEX_ERR_PARAM;
 		}
 
-		int bincount = 0;
-		for (int i = 0; i < (cf_vector_size(str_v) / 2); i++) {
-			if (bincount >= AS_SINDEX_BINMAX) {
-				cf_warning(AS_INFO, "Failed to create secondary index: More bins are specified "
-						"than %d for sindex creation %s ", AS_SINDEX_BINMAX, indexname_str);
-				INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-						"More bins specified than allowed");
-				cf_vector_destroy(str_v);
-				return AS_SINDEX_ERR_PARAM;
-			}
-
-			char *bname_str;
-			cf_vector_get(str_v, i * 2, &bname_str);
-			imd->bnames[i] = cf_strdup(bname_str);
-
-			char *type_str = NULL;
-			cf_vector_get(str_v, i * 2 + 1, &type_str);
-
-			if (!type_str) {
-				cf_warning(AS_INFO, "Failed to create secondary index: bin type must be specified"
-						" for sindex creation %s ", indexname_str);
-				INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-						"Invalid type must be [numeric,string]");
-				cf_vector_destroy(str_v);
-				return AS_SINDEX_ERR_PARAM;
-			}
-			else if        (strncasecmp(type_str, "string", 6) == 0) {
-				imd->btype[i] = AS_SINDEX_KTYPE_DIGEST;
-			} else if (strncasecmp(type_str, "numeric", 7) == 0) {
-				imd->btype[i] = AS_SINDEX_KTYPE_LONG;
-			} else {
-				cf_warning(AS_INFO, "Failed to create secondary index : invalid bin type %s "
-						"for sindex creation %s", type_str, indexname_str);
-				INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-						"Invalid type must be [numeric,string]");
-				cf_vector_destroy(str_v);
-				return AS_SINDEX_ERR_PARAM;
-			}
-			bincount++;
+		char *path_str;
+		cf_vector_get(str_v, i * 2, &path_str);
+		imd->path_str = cf_strdup(path_str);
+		// Extract the path and bin
+		if (as_sindex_extract_bin_path(imd, path_str)) {
+			cf_warning(AS_INFO, "Failed to create secondary index: Path_str is not valid- %s", path_str);
+			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER, "Invalid path");
+			return AS_SINDEX_ERR_PARAM;
 		}
-		imd->num_bins = bincount;
 
-		for (int i = 0; i < AS_SINDEX_BINMAX; i++) {
-			if (imd->bnames[i] &&
-					(strlen(imd->bnames[i]) >= BIN_NAME_MAX_SZ)) {
-				cf_warning(AS_INFO, "Failed to create secondary creation: Bin Name %s longer "
-						"than allowed (%d) for sindex creation %s", imd->bnames[i],
-						BIN_NAME_MAX_SZ, indexname_str);
-				INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
-						"Bin Name too long");
-				return AS_SINDEX_ERR_PARAM;
-			}
+		if (!imd->bnames[i]) {
+			cf_warning(AS_INFO, "Failed to create secondary index: bin name must be specified for sindex creation");
+			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER, "Invalid bin name");
+			cf_vector_destroy(str_v);
+			return AS_SINDEX_ERR_PARAM;
 		}
-		cf_vector_destroy(str_v);
+
+		// Extract data type to index
+		char *type_str = NULL;
+		cf_vector_get(str_v, i * 2 + 1, &type_str);
+
+		if (!type_str) {
+			cf_warning(AS_INFO, "Failed to create secondary index: bin type must be specified"
+					" for sindex creation %s ", indexname_str);
+			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER, "Invalid type must be [numeric,string]");
+			cf_vector_destroy(str_v);
+			return AS_SINDEX_ERR_PARAM;
+		}
+		else if (strncasecmp(type_str, "string", 6) == 0) {
+			imd->btype[i] = AS_SINDEX_KTYPE_DIGEST;
+		} else if (strncasecmp(type_str, "numeric", 7) == 0) {
+			imd->btype[i] = AS_SINDEX_KTYPE_LONG;
+		} else {
+			cf_warning(AS_INFO, "Failed to create secondary index : invalid bin type %s "
+					"for sindex creation %s", type_str, indexname_str);
+			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER,
+					"Invalid type must be [numeric,string]");
+			cf_vector_destroy(str_v);
+			return AS_SINDEX_ERR_PARAM;
+		}
+		bincount++;
 	}
-	return AS_SINDEX_OK;
 
+	imd->num_bins = bincount;
+	for (int i = 0; i < imd->num_bins; i++) {
+		if (imd->bnames[i] && (strlen(imd->bnames[i]) >= BIN_NAME_MAX_SZ)) {
+			cf_warning(AS_INFO, "Failed to create secondary creation: Bin Name %s longer "
+					"than allowed (%d) for sindex creation %s", imd->bnames[i],
+					BIN_NAME_MAX_SZ, indexname_str);
+			INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_PARAMETER, "Bin Name too long");
+			return AS_SINDEX_ERR_PARAM;
+		}
+	}
+	cf_vector_destroy(str_v);
+	return AS_SINDEX_OK;
 }
 
 // called for asinfo command to create a new sindex
@@ -6288,28 +6498,23 @@ int info_command_sindex_create(char *name, char *params, cf_dyn_buf *db)
 		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_INDEX_FOUND,
 				"Index with the same name already exists or this bin has already been indexed.");
 		goto ERR;
-	} else if(res == AS_SINDEX_ERR_PARAM) {
+	}
+	else if (res == AS_SINDEX_ERR_PARAM) {
 		cf_info(AS_INFO, "Index-name is too long, should be a max of: %d.", AS_ID_INAME_SZ - 1);
 		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_INDEX_NAME_MAXLEN,
 				"Index-name is too long.");
 		goto ERR;
 	}
-
-	// Check for max si's on the system : best-effort checking
-	// There is a hole here because we don't acquire a global lock for this check,
-	// but this is for the clean-case.
-	int i;
-	for (i = 0; i < AS_SINDEX_MAX; i++) {
-		// There is a valid new si slot that can be created.
-		if (ns->sindex[i].state == AS_SINDEX_INACTIVE) {
-			break;
-		}
-	}
-
-	if (i == AS_SINDEX_MAX) {
-		cf_info(AS_INFO, "System already has %d indexes and is maxed-out, cannot create new index", AS_SINDEX_MAX);
+	else if (res == AS_SINDEX_ERR_MAXCOUNT) {
+		cf_info(AS_INFO, "More than %d index are not allowed per namespace.", AS_SINDEX_MAX);
 		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_INDEX_MAXCOUNT,
-				"System already has maximum number of indexes, cannot create new index");
+				"Reached maximum number of sindex allowed");
+		goto ERR;
+
+	}
+	else if (res != AS_SINDEX_OK) {
+		cf_info(AS_INFO, "Index creation failed. Error %d", res);
+		INFO_COMMAND_SINDEX_FAILCODE(AS_PROTO_RESULT_FAIL_INDEX_GENERIC,"");
 		goto ERR;
 	}
 
@@ -6554,77 +6759,40 @@ int info_command_sindex_repair(char *name, char *params, cf_dyn_buf *db) {
 	return(0);
 }
 
-int info_command_set_scan_priority(char *name, char *params, cf_dyn_buf *db) {
-	// Transaction id
-	char id[100];
-	int  id_len = sizeof(id);
-
-	// Scan Priority
-	char sp[20];
-	int sp_len = sizeof(sp);
-
-	int priority = 0;
-	uint64_t trid;
-	if (0 == as_info_parameter_get(params, "id", id, &id_len)) {
-		trid = strtoull(id, NULL, 10);
-	} else {
-		cf_dyn_buf_append_string(db, "Scan job id not specified");
-		return 0;
-	}
-
-	// Priority low maps to 1 transaction thread
-	// medium, auto to 3
-	// high to 5
-	if( 0 == as_info_parameter_get(params, "value", sp, &sp_len)) {
-		if(strncmp(sp, "low", 4) == 0 || strncmp(sp, "LOW", 4) == 0) {
-			priority = 1;
-		}
-		else if(strncmp(sp, "medium", 7) == 0 || strncmp(sp, "MEDIUM", 7) == 0 ) {
-			priority = 3;
-		}
-		else if(strncmp(sp, "auto", 5) == 0 || strncmp(sp, "AUTO", 5) == 0) {
-			priority = 3;
-		}
-		else if(strncmp(sp, "high", 5) == 0 || strncmp(sp, "HIGH", 5) == 0) {
-			priority = 5;
-		}
-		else {
-			cf_dyn_buf_append_string(db, "Invalid priority, try again\n");
-			return 0;
-		}
-	}
-
-	if (!as_tscan_set_priority(trid, priority)) {
-		cf_dyn_buf_append_string(db, "Transaction Not Found");
-	}
-	else {
-		cf_dyn_buf_append_string(db, "Ok");
-	}
-
-	return 0;
-}
-
 int info_command_abort_scan(char *name, char *params, cf_dyn_buf *db) {
 	char context[100];
 	int  context_len = sizeof(context);
-	bool found = false;
+	int rv = -1;
 	if (0 == as_info_parameter_get(params, "id", context, &context_len)) {
 		uint64_t trid;
 		trid = strtoull(context, NULL, 10);
 		if (trid != 0) {
-			found = as_tscan_abort(trid);
+			rv = as_tscan_abort(trid);
 		}
 	}
 
-	if (!found) {
-		cf_dyn_buf_append_string(db, "Transaction Not Found");
+	if (rv != 0) {
+		cf_dyn_buf_append_string(db, "ERROR:");
+		cf_dyn_buf_append_int(db, AS_PROTO_RESULT_FAIL_NOTFOUND);
+		cf_dyn_buf_append_string(db, ":Transaction Not Found");
 	}
 	else {
-		cf_dyn_buf_append_string(db, "Ok");
+		cf_dyn_buf_append_string(db, "OK");
 	}
 
 	return 0;
 }
+
+int info_command_abort_all_scans(char *name, char *params, cf_dyn_buf *db) {
+
+	int n_scans_killed = as_tscan_abort_all();
+
+	cf_dyn_buf_append_string(db, "OK - number of scans killed: ");
+	cf_dyn_buf_append_int(db, n_scans_killed);
+
+	return 0;
+}
+
 int info_command_query_kill(char *name, char *params, cf_dyn_buf *db) {
 	char context[100];
 	int  context_len = sizeof(context);
@@ -6909,7 +7077,7 @@ as_info_init()
 	as_info_set("node", istr, true);                     // Node ID. Unique 15 character hex string for each node based on the mac address and port.
 	as_info_set("name", istr, false);                    // Alias to 'node'.
 	// Returns list of features supported by this server
-	as_info_set("features", "as_msg;replicas-read;replicas-prole;replicas-write;replicas-master;cluster-generation;partition-info;partition-generation;udf", true);
+	as_info_set("features", "replicas-all;replicas-master;replicas-prole;udf", true);
 	if (g_config.hb_mode == AS_HB_MODE_MCAST) {
 		sprintf(istr, "%s:%d", g_config.hb_addr, g_config.hb_port);
 		as_info_set("mcast", istr, false);               // Returns the multicast heartbeat address and port used by this server. Only available in multicast heartbeat mode.
@@ -6920,7 +7088,7 @@ as_info_init()
 	}
 
 	// All commands accepted by asinfo/telnet
-	as_info_set("help", "alloc-info;asm;build;bins;config-get;config-set;digests;"
+	as_info_set("help", "alloc-info;asm;build;bins;config-get;config-set;df;digests;"
 				"dump-fabric;dump-hb;dump-migrates;dump-msgs;dump-paxos;dump-smd;"
 				"dump-wb;dump-wb-summary;dump-wr;dun;get-config;get-sl;hist-dump;"
 				"hist-track-start;hist-track-stop;jem-stats;jobs;latency;log;log-set;"
@@ -6951,6 +7119,7 @@ as_info_init()
 	as_info_set_dynamic("replicas-prole",info_get_replicas_prole, false);   // Base 64 encoded binary representation of partitions this node is prole (replica) for.
 	as_info_set_dynamic("replicas-write",info_get_replicas_write, false);   //
 	as_info_set_dynamic("replicas-master",info_get_replicas_master, false); // Base 64 encoded binary representation of partitions this node is master (replica) for.
+	as_info_set_dynamic("replicas-all", info_get_replicas_all, false);      // Base 64 encoded binary representation of partitions this node is replica for.
 	as_info_set_dynamic("service",info_get_service, false);           // IP address and server port for this node, expected to be a single.
 	                                                                  // address/port per node, may be multiple address if this node is configured.
 	                                                                  // to listen on multiple interfaces (typically not advised).
@@ -6974,6 +7143,7 @@ as_info_init()
 	as_info_set_command("asm", info_command_asm, PERM_SERVICE_CTRL);                          // Control the operation of the ASMalloc library.
 	as_info_set_command("config-get", info_command_config_get, PERM_NONE);                    // Returns running config for specified context.
 	as_info_set_command("config-set", info_command_config_set, PERM_SET_CONFIG);              // Set a configuration parameter at run time, configuration parameter must be dynamic.
+	as_info_set_command("df", info_command_double_free, PERM_SERVICE_CTRL);                   // Do an intentional double "free()" to test Double "free()" Detection.
 	as_info_set_command("dump-fabric", info_command_dump_fabric, PERM_LOGGING_CTRL);          // Print debug information about fabric to the log file.
 	as_info_set_command("dump-hb", info_command_dump_hb, PERM_LOGGING_CTRL);                  // Print debug information about heartbeat state to the log file.
 	as_info_set_command("dump-migrates", info_command_dump_migrates, PERM_LOGGING_CTRL);      // Print debug information about migration.
@@ -7022,7 +7192,7 @@ as_info_init()
 	as_info_set_command("udf-clear-cache", udf_cask_info_clear_cache, PERM_UDF_MANAGE);
 
 	// JOBS
-	as_info_set_command("jobs", info_command_mon_cmd, PERM_SERVICE_CTRL);  // Manipulate the multi-key lookup monitoring infrastructure.
+	as_info_set_command("jobs", info_command_mon_cmd, PERM_JOB_MONITOR);  // Manipulate the multi-key lookup monitoring infrastructure.
 
 	// Undocumented Secondary Index Command
 	as_info_set_command("sindex-histogram", info_command_sindex_histogram, PERM_SERVICE_CTRL);
@@ -7031,10 +7201,11 @@ as_info_init()
 	as_info_set_command("sindex-qnodemap", info_command_sindex_qnodemap, PERM_NONE);
 
 	as_info_set_dynamic("query-list", as_query_list, false);
-	as_info_set_command("query-kill", info_command_query_kill, PERM_SERVICE_CTRL);
+	as_info_set_command("query-kill", info_command_query_kill, PERM_QUERY_MANAGE);
 	as_info_set_dynamic("query-stat", as_query_stat, false);
-	as_info_set_command("scan-abort", info_command_abort_scan, PERM_SERVICE_CTRL);  // Abort a tscan with a given id.
-	as_info_set_dynamic("scan-list", as_tscan_list, false);                         // List job ids of all scans.
+	as_info_set_command("scan-abort", info_command_abort_scan, PERM_SCAN_MANAGE);            // Abort a scan with a given id.
+	as_info_set_command("scan-abort-all", info_command_abort_all_scans, PERM_SCAN_MANAGE);   // Abort all scans.
+	as_info_set_dynamic("scan-list", as_tscan_list, false);                                  // List job ids of all scans.
 	as_info_set_command("sindex-describe", info_command_sindex_describe, PERM_NONE);
 	as_info_set_command("sindex-stat", info_command_sindex_stat, PERM_NONE);
 	as_info_set_command("sindex-list", info_command_sindex_list, PERM_NONE);
@@ -7054,7 +7225,7 @@ as_info_init()
 
 	as_fabric_register_msg_fn(M_TYPE_INFO, info_mt, sizeof(info_mt), info_msg_fn, 0 /* udata */ );
 
-	// Take necessery steps if specific address is given in service address 
+	// Take necessery steps if specific address is given in service address
 	if (strcmp(g_config.socket.addr, "0.0.0.0") != 0 ) {
 		if (g_config.external_address != NULL){
 			// check external-address is matches with service address
@@ -7063,7 +7234,7 @@ as_info_init()
 						g_config.external_address, g_config.socket.addr);
 			}
 		} else {
-			// Check if service address is any. If not any then put this adress in external address 
+			// Check if service address is any. If not any then put this adress in external address
 			// to avoid updation of service list continuosly
 			g_config.external_address = g_config.socket.addr;
 		}

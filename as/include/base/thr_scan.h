@@ -120,6 +120,7 @@ typedef struct {
 	cf_vector *         binlist;
 	udf_call *          call;                       // read copy @TODO should be ref counted
 	as_aggr_call *      aggr_call;                  // read copy @TODO should be ref counted
+	bool *				aborted;
 } tscan_task_data;
 
 /* Function declarations */
@@ -128,7 +129,7 @@ extern int as_scan(as_transaction *tr);
 extern int as_scan_kill(int tid);
 extern int as_tscan_list(char *name, cf_dyn_buf *db);
 extern int as_tscan_abort(uint64_t trid);
-extern bool as_tscan_set_priority(uint64_t trid, uint16_t priority);
+extern int as_tscan_abort_all();
 
 // Call when the incoming fd blows up
 extern void as_scan_cleanup_fd(int fd);

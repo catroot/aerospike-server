@@ -27,19 +27,39 @@
 #include "ai_obj.h"
 #include <citrusleaf/cf_ll.h>
 
+// NB: Note that sindex_kvs_arr and dig_arr has to have similar
+// overlapping order of things ... do not change the array size
+// or structure if you do not know what you are doing 
+// Both are used by aggregation code
 #define NUM_DIGS_PER_ARR 51
+#define NUM_SINDEX_KV_PER_ARR NUM_DIGS_PER_ARR
 
-typedef struct dig_arr_t { //NOTE: this data structure MUST be 1KB exactly
-	cf_digest digs[NUM_DIGS_PER_ARR];
+typedef struct dig_arr_t { 
 	uint32_t  num;
+	cf_digest digs[NUM_DIGS_PER_ARR];
 } __attribute__ ((packed)) dig_arr_t;
+
+typedef struct sindex_kv_arr_s { //NOTE: this data structure MUST be 1KB exactly
+	uint32_t      num;
+	cf_digest     digs[NUM_SINDEX_KV_PER_ARR];	
+	as_sindex_key skeys[NUM_SINDEX_KV_PER_ARR];
+} __attribute__ ((packed)) sindex_kv_arr;
+
 
 typedef struct ll_recl_element_s {
 	cf_ll_element   ele;
 	dig_arr_t     * dig_arr;
 } ll_recl_element;
 
+
+typedef struct ll_sindex_kv_element_s {
+	cf_ll_element   ele;
+	sindex_kv_arr * skv_arr;
+} ll_sindex_kv_element;
+
 void releaseDigArrToQueue(void *v);
+
+void release_skv_arr_to_queue(sindex_kv_arr * v);
 
 int ai_findandset_imatch(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, int idx);
 
@@ -49,9 +69,9 @@ int ai_btree_create(as_sindex_metadata *imd, int simatch, int *bimatch, int nprt
 
 int ai_btree_destroy(as_sindex_metadata *imd);
 
-int ai_btree_put(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, as_sindex_key *key, void *value);
+int ai_btree_put(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, void *key, cf_digest *value);
 
-int ai_btree_delete(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, as_sindex_key *key, void *val);
+int ai_btree_delete(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, void *key, cf_digest *val);
 
 int ai_btree_query(as_sindex_metadata *imd, as_sindex_range *range, as_sindex_qctx *qctx);
 
@@ -87,7 +107,9 @@ int ai_btree_build_defrag_list(as_sindex_metadata *imd, as_sindex_pmetadata *pim
 
 bool ai_btree_defrag_list(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, cf_ll *apk2d, ulong n2del, ulong *deleted);
 
-int ai_btree_key_hash(as_sindex_metadata *imd, as_sindex_bin *sbin);
+int ai_btree_key_hash_from_sbin(as_sindex_metadata *imd, as_sindex_bin_data *sbin);
+
+int ai_btree_key_hash(as_sindex_metadata *imd, void *skey);
 
 int ai_post_index_creation_setup_pmetadata(as_sindex_metadata *imd, as_sindex_pmetadata *pimd, int simatch, int idx);
 

@@ -322,36 +322,6 @@
 //-- Note that we've tried to make the mapping somewhat cannonical where
 //-- possible.
 //
-// Here are the fields (the contents) of the Property Maps.  We've annotated
-// the fields that are used by TopRecords and SubRecords (and both).
-// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-#define PM_ItemCount             'I' // (Top): Count of all items in LDT
-#define PM_Version               'V' // (Top): Code Version
-#define PM_LdtType               'T' // (Top): Type: stack, set, map, list
-#define PM_BinName               'B' // (Top): LDT Bin Name
-#define PM_Magic                 'Z' // (All): Special Sauce
-#define PM_EsrDigest             'E' // (All): Digest of ESR
-#define PM_RecType               'R' // (All): Type of Rec:Top,Ldr,Esr,CDir
-#define PM_LogInfo               'L' // (All): Log Info (currently unused)
-#define PM_ParentDigest          'P' // (Subrec): Digest of TopRec
-#define PM_SelfDigest            'D' // (Subrec): Digest of THIS Record
-
-// Here are the fields that are found in the SINGLE "Hidden" LDT Control Map.
-//-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-//-- Record Level Property Map (RPM) Fields: One RPM per record
-//-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-#define RPM_LdtCount             'C'  // Number of LDTs in this rec
-#define RPM_Version              'V'  // Partition Version Info (6 bytes)
-#define RPM_Magic                'Z'  // Special Sauce
-#define RPM_SelfDigest           'D'  // Digest of this record
-
-
-// Define the LDT Hidden Bin Name -- for any record that contains LDTs
-#define REC_LDT_CTRL_BIN         "LDTCONTROLBIN"
-
-// Define the Property Map Bin Name for Sub Records
-#define SUBREC_PROP_BIN          "SR_PROP_BIN"
-#define LDT_VERSION_SZ           6
 
 
 //------------------------------------------------------------------------------
@@ -381,6 +351,17 @@ const ldt_op_props LLIST_OP_PROPS[] = {
 		{ "exists",			LDT_READ_OP },
 		{ "filter",			LDT_READ_OP },
 		{ "find",			LDT_READ_OP },
+		{ "take",			LDT_WRITE_OP },
+		{ "find_from",		LDT_READ_OP },
+		{ "take_from",		LDT_WRITE_OP },
+		{ "find_first",		LDT_READ_OP },
+		{ "take_first",		LDT_WRITE_OP },
+		{ "find_last",		LDT_READ_OP },
+		{ "take_last",		LDT_WRITE_OP },
+		{ "find_range",		LDT_READ_OP },
+		{ "take_range",		LDT_WRITE_OP },
+		{ "find_range_lim",	LDT_READ_OP },
+		{ "take_range_lim",	LDT_WRITE_OP },
 		{ "get_capacity",	LDT_READ_OP },
 		{ "ldt_exists",		LDT_READ_OP },
 		{ "range",			LDT_READ_OP },
@@ -388,7 +369,7 @@ const ldt_op_props LLIST_OP_PROPS[] = {
 		{ "remove_all",		LDT_WRITE_OP },
 		{ "remove_range",	LDT_WRITE_OP },
 		{ "scan",			LDT_READ_OP },
-		{ "set_capacity",	LDT_WRITE_OP },
+		{ "setPageSize",	LDT_WRITE_OP },
 		{ "size",			LDT_READ_OP },
 		{ "update",			LDT_WRITE_OP },
 		{ "update_all",		LDT_WRITE_OP }
@@ -889,7 +870,7 @@ as_ldt_get_from_map(const as_map *prop_map, char prop_type, void *value)
 int
 as_ldt_set_in_map(as_map *prop_map, char prop_type, void *value)
 {
-	cf_debug(AS_LDT, "[ENTER] PropType(%c)", prop_type );
+	cf_detail(AS_LDT, "[ENTER] PropType(%c)", prop_type );
 
 	int rv = 0;
 	switch(prop_type) {
@@ -912,7 +893,7 @@ as_ldt_set_in_map(as_map *prop_map, char prop_type, void *value)
 					cf_free(valstr2);
 				}
 			} else {
-				cf_detail(AS_LDT, "Failed to set version %c=%d",
+				cf_debug(AS_LDT, "Failed to set version %c=%d",
 						prop_type, ldt_version);
 				// note: not necessary to destroy key_val here.
 				rv = -2;
@@ -1015,6 +996,8 @@ as_ldt_parent_storage_set_version(as_storage_rd *rd, uint64_t ldt_version, uint8
 	as_serializer_destroy(&s);
 	as_buffer_destroy(&buf);
 	as_val_destroy(valp);
+	cf_debug(AS_LDT, "(%s:%d) Setting parent version to %ld %d", fname, lineno, ldt_version,rd->r->generation);
+	//PRINT_STACK();
 
 	rd->write_to_device = true;
 	return pbytes;
@@ -1049,7 +1032,7 @@ as_ldt_parent_storage_get_version(as_storage_rd *rd, uint64_t *ldt_version, bool
 				cf_warning_digest(AS_LDT, &rd->keyd, "Control bin not found LDT parent record %s %d", fname, lineno);
 			}
 		} else {
-			cf_detail(AS_LDT, "Control bin not found");
+			cf_debug(AS_LDT, "Control bin not found");
 		}
 		rv                      = -1;
 	} else {
@@ -1074,7 +1057,7 @@ as_ldt_parent_storage_get_version(as_storage_rd *rd, uint64_t *ldt_version, bool
 		rv                      = as_ldt_get_from_map(prop_map, RPM_Version, (void *)ldt_version);
 		as_val_destroy(valp);
 	}
-	cf_detail(AS_LDT, "Version Search find %ld with rv = %d", *ldt_version, rv);
+	cf_debug(AS_LDT, "(%s,%d)Version Search find %ld with rv = %d", fname, lineno, *ldt_version, rv);
 	return rv;
 }
 
@@ -1115,7 +1098,7 @@ as_ldt_subrec_storage_get_digests(as_storage_rd *rd, cf_digest *edigest, cf_dige
 		cf_warning(AS_LDT, "Property Bin %s Corrupted", SUBREC_PROP_BIN);
 		return -2;
 	}
-	cf_debug(AS_LDT, "Got a value from the bin: type(%d)", valp->type);
+	cf_detail(AS_LDT, "Got a value from the bin: type(%d)", valp->type);
 
 	// We must always retrieve typed values from as_val using the type specific
 	// accessor function -- which will return NULL if we guessed wrong on the
@@ -1230,7 +1213,7 @@ as_ldt_is_parent_and_version_match(uint64_t subrec_version, as_index_tree *tree,
 
 	if (!as_ldt_record_is_parent(r)) {
 		// if parent is not a LDT parent version does not match
-		cf_detail(AS_LDT, "LDT_INDEXBIT Expected Parent Bits Not Found");
+		cf_debug(AS_LDT, "LDT_INDEXBIT Expected Parent Bits Not Found");
 		as_record_done(&r_ref, ns);
 		return false;
 	}
@@ -1250,11 +1233,11 @@ as_ldt_is_parent_and_version_match(uint64_t subrec_version, as_index_tree *tree,
 	uint64_t parent_version = 0;
 	rv = as_ldt_parent_storage_get_version(&rd, &parent_version, false, __FILE__, __LINE__);
 	if (0 != rv) {
-		cf_detail(AS_LDT, "LDT_SUB_GC Something wrong could not get LDT parent version rv = %d", rv);
+		cf_debug(AS_LDT, "LDT_SUB_GC Something wrong could not get LDT parent version rv = %d", rv);
 		goto Cleanup;
 	}
 
-	cf_detail_digest(AS_LDT, keyd, "LDT_SUB_GC Subrec and parent version check %ld != %ld %p",
+	cf_debug_digest(AS_LDT, keyd, "LDT_SUB_GC Subrec and parent version check %ld != %ld %p",
 			  parent_version, subrec_version, rd.r);
 	if (parent_version == subrec_version) {
 		rv = 0;
@@ -1323,7 +1306,7 @@ as_ldt_sub_gc_fn(as_index_ref *r_ref, void *udata)
 	cf_atomic_int_incr(&ns->lstats.ldt_gc_processed);
 
 	if (r->void_time != 0) {
-		cf_detail(AS_LDT, "No void time should be set in subrecord !!! found %d", r->void_time);
+		cf_debug(AS_LDT, "No void time should be set in subrecord !!! found %d", r->void_time);
 	}
 
 	// Subrecord Version
@@ -1575,37 +1558,42 @@ as_ldt_record_pickle(ldt_record *lrecord,
 		// This macro is a for-loop thru the SR list and a test for valid SR entry
 		FOR_EACH_SUBRECORD(i, j, lrecord) {
 			udf_record *c_urecord = &lrecord->chunk[i].slots[j].c_urecord;
-			is_delete             = (c_urecord->pickled_buf) ? false : true;
 			as_transaction *c_tr  = c_urecord->tr;
 
-			if ( ((!c_urecord->pickled_buf) || (c_urecord->pickled_sz <= 0)) && !is_delete ) {
-				cf_warning(AS_RW, "Got an empty pickled buf while trying to "
-						" replicate record with digest %"PRIx64" %p, %d, %d",
-						(uint64_t *)&c_tr->keyd, pickled_buf, pickled_sz, is_delete);
-				ret = -2;
+
+			m[ops] = as_fabric_msg_get(M_TYPE_RW);
+			if (!m[ops]) {
+				ret = -3;
 				goto Out;
 			}
-
-			// if pickled_buf is there then it is a write operation
-			if (!is_delete && c_urecord->pickled_buf) {
-				cf_detail(AS_LDT, "MULTI_OP: Packing LDT SUB Record");
-				m[ops] = as_fabric_msg_get(M_TYPE_RW);
-				if (!m[ops]) {
-					ret = -3;
-					goto Out;
+			cf_detail(AS_LDT, "MULTI_OP: Packing Write for LDT SUB Record %d", c_urecord->ldt_rectype_bits);
+			bool reset_flag = true;
+			if (!c_urecord->pickled_buf) {
+				// Fake it as delete
+				if (c_tr->msgp->msg.info2 & AS_MSG_INFO2_DELETE) {
+					reset_flag = false;	
+				} else {
+					c_tr->msgp->msg.info2 |= AS_MSG_INFO2_DELETE;
+					reset_flag = true;
 				}
-				rw_msg_setup(m[ops], c_tr, &c_tr->keyd,
-								&c_urecord->pickled_buf,
-								c_urecord->pickled_sz,
-								c_urecord->pickled_void_time,
-								&c_urecord->pickled_rec_props,
-								RW_OP_WRITE,
-								c_urecord->ldt_rectype_bits, true);
-				buflen = 0;
-				msg_fillbuf(m[ops], NULL, &buflen);
-				sz += buflen;
-				ops++;
 			}
+
+			rw_msg_setup(m[ops], c_tr, &c_tr->keyd,
+							&c_urecord->pickled_buf,
+							c_urecord->pickled_sz,
+							c_urecord->pickled_void_time,
+							&c_urecord->pickled_rec_props,
+							RW_OP_WRITE,
+							c_urecord->ldt_rectype_bits, true);
+
+			if (reset_flag) {
+				c_tr->msgp->msg.info2 &= ~AS_MSG_INFO2_DELETE;
+			}
+			
+			buflen = 0;
+			msg_fillbuf(m[ops], NULL, &buflen);
+			sz += buflen;
+			ops++;
 		}
 
 		if (sz) {
@@ -1632,7 +1620,7 @@ as_ldt_record_pickle(ldt_record *lrecord,
 Out:
 
 	if (ret) {
-		cf_detail(AS_LDT, "MULTI_OP Packing failed with ret = %d", ret);
+		cf_debug(AS_LDT, "MULTI_OP Packing failed with ret = %d", ret);
 		if (*pickled_buf) {
 			cf_free(*pickled_buf);
 			*pickled_buf = NULL;
@@ -1649,4 +1637,194 @@ Out:
 	// TODO: Check value of ret and do the needed cleanup
 	return ret;
 }
+int
+as_ldt_get_key(char c, as_string *key, char *key_buffer)
+{
+	sprintf(key_buffer, "%c", c);
+	as_string_init(key, key_buffer, false);
+	return 0;
+}
 
+char *
+as_ldt_leaf_getNext(as_storage_rd *rd)
+{
+	as_bin * bb    = as_bin_get(rd, (uint8_t *)"LsrControlBin", 13);
+	as_val * srMap = as_val_frombin(bb);
+
+	char key_buffer[2]; as_string key;
+	as_ldt_get_key((char)LF_NextPage, &key, key_buffer);
+
+	as_bytes *dig = (as_bytes *)as_hashmap_get((as_hashmap*)srMap, (as_val *)&key);
+	char *curDigest = as_val_tostring(dig);	
+	as_val_destroy(srMap);
+	return curDigest;
+}
+
+bool
+as_bin_is_ldt_bin(as_map * prop_map)
+{
+	bool ret = true;
+
+	char key_buffer[2]; as_string key;
+	as_ldt_get_key((char) PM_Magic, &key, key_buffer);
+
+	as_val * value = as_hashmap_get((as_hashmap *)prop_map, (as_val *)&key); 
+	if (!value) {
+		return false;
+	}
+
+	if (strcmp (as_string_get((as_string*)value), "MAGIC")) {
+		ret = false;
+	}
+	
+	if (ret) {
+		as_ldt_get_key((char )PM_LdtType, &key, key_buffer);
+		value = as_hashmap_get((as_hashmap *)prop_map, (as_val *) &key); 
+		if (strcmp(as_string_get((as_string*)value), "LLIST"))
+			ret = false;
+	}
+	return ret;
+}
+as_list *
+as_ldt_leaf_scan(as_storage_rd *rd)
+{
+	as_bin * bb  = as_bin_get(rd, (uint8_t *)"LsrListBin", 10);
+	as_list *sl  = (as_list *)as_val_frombin(bb); 
+	return sl;
+}
+
+as_list * 
+as_bin_get_llist(as_namespace *ns, as_index_tree *sub_tree, as_val *ctrl_list, uint64_t ldt_version) 
+{
+	as_map *propMap = as_list_get_map((as_list *)ctrl_list, 0);
+	if (!propMap) {
+		cf_debug(AS_LDT, "Control Bin Property Map not of type map");
+		return NULL;
+	}
+
+	as_map *ldtMap = as_list_get_map((as_list *)ctrl_list, 1);
+	if (!ldtMap) {
+		cf_debug(AS_LDT, "Control Bin ldt Map not of type map");
+		return NULL;
+	}
+	
+	char key_buffer[2]; as_string key;
+
+	as_ldt_get_key((char)LS_StoreState , &key, key_buffer);
+	as_string *storestate = (as_string *)as_hashmap_get((as_hashmap *)ldtMap, (as_val *)&key);
+	char *storestatestr = as_val_tostring(storestate);
+	cf_debug(AS_LDT, "storestate |%s|", storestatestr);
+	if (strcmp("\"C\"", storestatestr) == 0) {
+		as_ldt_get_key((char)LS_CompactList, &key, key_buffer);
+		as_list *rl = (as_list *)as_hashmap_get((as_hashmap *)ldtMap, (as_val *)&key);
+		as_val_reserve(rl);
+		cf_free(storestatestr);
+		return rl;
+	}	
+	cf_free(storestatestr);
+
+	as_ldt_get_key((char)LS_LeftLeafDigest, &key, key_buffer);
+	as_bytes *leftMostDigest = (as_bytes *)as_hashmap_get((as_hashmap *)ldtMap, (as_val *)&key);
+	char *curDigest = as_val_tostring(leftMostDigest);
+
+	as_arraylist *rl = as_arraylist_new(100, 100);
+	while (true) {
+		if (!curDigest || (!strcmp(curDigest,"0"))) { 
+			return (as_list *)rl;
+		}
+			
+		// 1. Setup digest
+		cf_digest keyd;
+		if (as_ldt_string_todigest(curDigest, &keyd)) {
+			return (as_list *)rl;
+		}
+		as_ldt_subdigest_setversion(&keyd, ldt_version);
+		cf_free(curDigest);
+
+		// 2. Open Record
+		as_index_ref   sub_r_ref; 
+		as_storage_rd  sub_rd;
+		sub_r_ref.skip_lock = true;
+		int rv = as_record_get(sub_tree, &keyd, &sub_r_ref, ns);
+		if (rv) {
+			cf_warning(AS_LDT, "LDT stucture invalid");
+			as_val_destroy(rl);
+			return NULL;
+		}
+
+		as_record *sub_r = sub_r_ref.r;
+
+		as_storage_record_open(ns, sub_r, &sub_rd, &sub_r->key);
+		sub_rd.n_bins = as_bin_get_n_bins(sub_r, &sub_rd);
+		// Have bound checks ...
+		as_bin stack_bins[(sub_r && !ns->storage_data_in_memory) ? sub_rd.n_bins : 0];
+		sub_rd.bins = as_bin_get_all(sub_r, &sub_rd, stack_bins);
+
+		// 3. Scan the current leaf
+		as_list *sl = as_ldt_leaf_scan(&sub_rd); 
+		as_arraylist_iterator it;
+		as_arraylist_iterator_init(&it, (as_arraylist *)sl);
+		while (as_arraylist_iterator_has_next(&it)) {
+			as_val * val = (as_val *)as_arraylist_iterator_next(&it);
+			as_val_reserve(val);
+			as_arraylist_append((as_arraylist *)rl, val);
+		}
+		as_val_destroy(sl);
+		as_arraylist_iterator_destroy(&it);
+
+		// 4. Find next 
+		curDigest = as_ldt_leaf_getNext(&sub_rd);
+		
+		// 5. Close Current
+		as_storage_record_close(sub_r, &sub_rd);
+		as_record_done(&sub_r_ref, ns);
+	}
+	return (as_list *)rl;
+}
+
+as_val *
+as_llist_scan(as_namespace *ns, as_index_tree *sub_tree, as_storage_rd  *rd, as_bin *binp) 
+{
+	uint8_t type = as_particle_type_convert(as_bin_get_particle_type(binp));
+	if (type != AS_PARTICLE_TYPE_LIST) {
+		return NULL;
+	}
+
+	as_val * valp  = as_val_frombin(binp);
+	if (!valp) {
+		cf_warning(AS_LDT, "Property Bin %s Corrupted", SUBREC_PROP_BIN);
+		return NULL;
+	}
+
+	// We must always retrieve typed values from as_val using the type specific
+	// accessor function -- which will return NULL if we guessed wrong on the
+	// type that we're extracting.
+	const as_list * ctrl_list = as_list_fromval(valp);
+	if (!ctrl_list) {
+		cf_debug(AS_LDT, "Control bin is not of type list");
+		as_val_destroy(valp);
+		return NULL;
+	}
+
+	// Not ref counted need not be destroyed...
+	as_map *prop_map = as_list_get_map(ctrl_list, 0);
+	if (!prop_map) {
+		cf_debug(AS_LDT, "Control Bin Property Map not of type map");
+		as_val_destroy(valp);
+		return NULL;
+	}
+
+	as_list *result_list = NULL;
+	if (as_bin_is_ldt_bin(prop_map)) {
+		cf_debug(AS_LDT, "Bin %s is LDT Bin", as_bin_get_name_from_id(ns, binp->id));	
+		uint64_t ldt_version;
+		if (!as_ldt_parent_storage_get_version(rd, &ldt_version, true, __FILE__, __LINE__)) {
+			result_list = as_bin_get_llist(ns, sub_tree, (as_val *)ctrl_list, ldt_version); 
+		} 
+	} else {
+		cf_debug(AS_LDT, "Bin %s is _NOT_ LDT Bin", as_bin_get_name_from_id(rd->ns, binp->id));	
+	}
+
+	as_val_destroy(valp);
+	return (as_val *)result_list;
+}

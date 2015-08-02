@@ -232,6 +232,7 @@ udf_record_open(udf_record * urecord)
 			rec_rv = -2;
 		} else {
 			urecord->flag   |= UDF_RECORD_FLAG_OPEN;
+			urecord->flag   |= UDF_RECORD_FLAG_PREEXISTS;
 			cf_detail_digest(AS_UDF, &tr->keyd, "Open %p %x Digest:", urecord, urecord->flag);
 			udf_storage_record_open(urecord);
 		}
@@ -250,7 +251,6 @@ udf_record_open(udf_record * urecord)
  *
  * Parameters:
  * 		urec       : UDF record being operated on
- * 		release_rsv: If tree partition reservation is released
  *
  * Return value : Nothing
  *
@@ -261,7 +261,7 @@ udf_record_open(udf_record * urecord)
  * 		udf_record_destroy
  */
 void
-udf_record_close(udf_record *urecord, bool release_rsv)
+udf_record_close(udf_record *urecord)
 {
 	as_transaction *tr    = urecord->tr;
 	cf_debug_digest(AS_UDF, &tr->keyd, "[ENTER] Closing record key:");
@@ -275,13 +275,6 @@ udf_record_close(udf_record *urecord, bool release_rsv)
 		urecord->flag &= ~UDF_RECORD_FLAG_OPEN;
 		cf_detail_digest(AS_UDF, &urecord->tr->keyd,
 			"Storage Close:: Rec(%p) Flag(%x) Digest:", urecord, urecord->flag );
-	}
-
-	// No references are release in scope of UDF record
-	// only in case of aggregation for stream interface
-	if (tr && release_rsv) {
-		as_partition_release(&tr->rsv);
-		cf_atomic_int_decr(&g_config.dup_tree_count);
 	}
 
 	// Replication happens when the main record replicates
@@ -323,7 +316,6 @@ udf_record_init(udf_record *urecord)
 	// Init flag
 	urecord->flag               = UDF_RECORD_FLAG_ISVALID;
 	urecord->flag              |= UDF_RECORD_FLAG_ALLOW_UPDATES;
-	urecord->flag              |= UDF_RECORD_FLAG_ALLOW_DESTROY;
 
 	urecord->pickled_buf        = NULL;
 	urecord->pickled_sz         = 0;
@@ -1047,22 +1039,8 @@ udf_record_destroy(as_rec *rec)
 	}
 
 	udf_record *urecord = (udf_record *) as_rec_source(rec);
-
-	if (!(urecord->flag & UDF_RECORD_FLAG_ALLOW_DESTROY)) {
-		return false;
-	}
-
-	if (urecord->pickled_buf) {
-		cf_free(urecord->pickled_buf);
-		urecord->pickled_buf       = NULL;
-		urecord->pickled_sz        = 0;
-		urecord->pickled_void_time = 0;
-	}
-	if (urecord->pickled_rec_props.p_data) {
-		cf_free(urecord->pickled_rec_props.p_data);
-		as_rec_props_clear(&urecord->pickled_rec_props);
-	}
-	udf_record_close(urecord, false);
+	udf_record_close(urecord);
+	udf_record_cleanup(urecord, true);
 	return true;
 } 
 

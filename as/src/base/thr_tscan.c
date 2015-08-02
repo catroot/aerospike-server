@@ -1,7 +1,7 @@
 /*
  * thr_tscan.c
  *
- * Copyright (C) 2011-2014 Aerospike, Inc.
+ * Copyright (C) 2011-2015 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -23,6 +23,7 @@
 #include "base/thr_scan.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -130,7 +131,8 @@
 //#define PRL_SCAN 0
 
 // TODO - eventually, we'll do better than this hard-wired value.
-const size_t INITIAL_BUFBUILDER_SIZE = 8 * 1024 * 1024;
+const size_t INITIAL_BUFBUILDER_SIZE = 2 * 1024 * 1024;
+const size_t SCAN_PROTO_LIMIT = 1024 * 1024;
 
 msg_template tscan_mt[] = {
 	{ TSCAN_FIELD_OP,       M_FT_UINT32 }, // operation
@@ -170,6 +172,7 @@ typedef struct {
 
 void  scan_job_release_and_destroy(tscan_job *job);
 int   tscan_send_fin_to_client(tscan_job *job, uint32_t result_code);
+int   tscan_send_response_to_client( tscan_job *job, uint8_t *buf, size_t len);
 int   tscan_enqueue_udfjob(tscan_job *job);
 int   tscan_start_job(tscan_job *job, as_transaction *tr, bool scan_disconnected_job);
 void  dump_digest(cf_digest *dd) {
@@ -266,7 +269,7 @@ tscan_mem_op(mem_tracker *mt, uint32_t num_bytes, memtracker_op op)
 		ret = false;
 	}
 END:
-#endif 
+#endif
 	return ret;
 }
 
@@ -385,18 +388,7 @@ scan_job_done(tscan_job *job)
 
 	// Print end of sindex ticker here:
 	if (SCAN_JOB_IS_POPULATOR(job)) {
-		char *si_name = "<all>";
-		uint64_t si_memory   = (uint64_t)cf_atomic_int_get(job->ns->sindex_data_memory_used);
-
-		if (job->si) {
-			si_memory   = cf_atomic64_get(job->si->data_memory_used);
-			si_name = job->si->imd->iname;
-		}
-
-		cf_info(AS_SCAN, " Sindex-ticker done: ns=%s si=%s si-mem-used=%"PRIu64""
-				" elapsed=%"PRIu64" ms",
-				job->ns->name, si_name,
-				si_memory, cf_getms() - job->start_time);
+		as_sindex_ticker_done(job->ns, job->si, job->start_time);
 
 		if (job->job_type == SCAN_JOB_TYPE_SINDEX_POPULATEALL) {
 			as_sindex_boot_populateall_done(job->ns);
@@ -426,6 +418,36 @@ scan_udf_job_done(tscan_job *job, int rsp)
 			cf_atomic_int_get(job->n_obj_udf_success), cf_atomic_int_get(job->n_obj_udf_failed), cf_atomic_int_get(job->n_obj_udf_updated));
 }
 
+
+static void
+set_blocking(int fd, bool block)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+
+	if (flags < 0) {
+		cf_crash(AS_SCAN, "error while getting flags on FD %d (%d: %s)", fd, errno,
+				cf_strerror(errno));
+	}
+
+	flags = block ? flags & ~O_NONBLOCK : flags | O_NONBLOCK;
+
+	if (fcntl(fd, F_SETFL, flags) < 0) {
+		cf_crash(AS_SCAN, "error while setting flags on FD %d (%d: %s)", fd, errno,
+				cf_strerror(errno));
+	}
+}
+
+static inline void
+scan_release_file_handle(tscan_job *job)
+{
+	if (job->fd_h) {
+		set_blocking(job->fd_h->fd, false);
+		job->fd_h->fh_info &= ~FH_INFO_DONOT_REAP;
+		AS_RELEASE_FILE_HANDLE(job->fd_h);
+		job->fd_h = NULL;
+	}
+}
+
 void
 tscan_job_destructor( void *udata )
 {
@@ -438,11 +460,7 @@ tscan_job_destructor( void *udata )
 		udf_call_destroy(&job->call);
 		job->hasudf = false;
 	}
-	if (job->fd_h) {
-		cf_detail(AS_SCAN, "UDF: refcount of fd at destruction count is %d", cf_rc_count(job->fd_h));
-		AS_RELEASE_FILE_HANDLE(job->fd_h);
-		job->fd_h = NULL;
-	}
+	scan_release_file_handle(job);
 	if (job->ns) {
 		job->ns = NULL;
 	}
@@ -742,16 +760,14 @@ int tscan_start_job(tscan_job *job, as_transaction *tr, bool scan_disconnected_j
 		else if (tr) {
 			job->fd_h = tr->proto_fd_h;
 			job->fd_h->fh_info |= FH_INFO_DONOT_REAP;
+			set_blocking(job->fd_h->fd, true);
 			tr->proto_fd_h = 0;
 			cf_detail(AS_SCAN, "UDF: refcount of fd at the start of the time %d", cf_rc_count(job->fd_h));
 		}
 
 		// Print start of sindex ticker here:
 		if (SCAN_JOB_IS_POPULATOR(job)) {
-			cf_info(AS_SCAN, " Sindex-ticker start: ns=%s si=%s job=%s",
-					job->ns->name ? job->ns->name : "<all>",
-					job->si ? job->si->imd->iname : "<all>",
-					(job->job_type == SCAN_JOB_TYPE_SINDEX_POPULATEALL) ? "SINDEX_POPULATEALL" : "SINDEX_POPULATE");
+			as_sindex_ticker_start(job->ns, job->si);
 		}
 
 		for (int i = 0; i < AS_PARTITIONS; i++) {
@@ -785,6 +801,7 @@ tscan_start_udfjob(tscan_job *job, as_transaction *tr, bool disconnected)
 	// per record UDF at this point for the scan.
 	job->fd_h               = tr->proto_fd_h;
 	job->fd_h->fh_info     |= FH_INFO_DONOT_REAP;
+	set_blocking(job->fd_h->fd, true);
 	tr->proto_fd_h          = 0;
 	job->cur_partition_id   = 0; // start from partition_id
 	cf_detail(AS_SCAN, "UDF: Pushed scan UDF job into the queue [%"PRIu64" %p %p]", job->tid, job, job->fd_h);
@@ -794,9 +811,7 @@ tscan_start_udfjob(tscan_job *job, as_transaction *tr, bool disconnected)
 	if ((job->call.udf_type == AS_SCAN_UDF_OP_BACKGROUND)
 			|| (disconnected)) {
 		tscan_send_fin_to_client(job, AS_PROTO_RESULT_OK);
-		job->fd_h->fh_info &= ~FH_INFO_DONOT_REAP;
-		cf_rc_release(job->fd_h);
-		job->fd_h           = 0;
+		scan_release_file_handle(job);
 	}
 
 	return cf_queue_push(g_scan_udf_job_q, &job);
@@ -1122,7 +1137,7 @@ tscan_add_digest_list(cf_ll * recl, cf_digest * digest, int * dnum)
 	dig_arr_t *dt;
 	if (!create) {
 		dt = ((ll_recl_element*)ele)->dig_arr;
-		if (dt->num == 51) { // NUM_DIGS_PER_ARR
+		if (dt->num == NUM_SINDEX_KV_PER_ARR) {
 			create = true;
 		}
 	}
@@ -1188,8 +1203,9 @@ typedef struct tscan_aggr_tr_udata {
 } tscan_aggr_tr_udata_t;
 
 void
-tscan_aggr_tree_reduce_fn(as_index *r, void *udata)
+tscan_aggr_tree_reduce_fn(as_index_ref *r_ref, void *udata)
 {
+	as_index *r = r_ref->r;
 	tscan_aggr_tr_udata_t * d_ptr = (tscan_aggr_tr_udata_t *)(udata);
 	// If this is a valid set, check against the set of the record.
 	if (d_ptr->task->set_id != INVALID_SET_ID) {
@@ -1201,10 +1217,12 @@ tscan_aggr_tree_reduce_fn(as_index *r, void *udata)
 				cf_atomic64_decr(&d_ptr->task->si->stats.recs_pending);
 			}
 			cf_atomic_int_incr(&(d_ptr->task->pjob->n_obj_set_diff));
+			as_record_done(r_ref, d_ptr->task->ns);
 			return;
 		}
 	}
 	tscan_add_digest_list (d_ptr->recl, &(r->key), NULL);
+	as_record_done(r_ref, d_ptr->task->ns);
 }
 
 
@@ -1220,6 +1238,12 @@ void
 tscan_tree_reduce(as_index_ref *r_ref, void *udata)
 {
 	tscan_task_data *u = (tscan_task_data *) udata;
+
+	if (*u->aborted) {
+		as_record_done(r_ref, u->ns);
+		return;
+	}
+
 	cf_buf_builder **bb_r = &(u->bb);
 
 	as_index *r = r_ref->r;
@@ -1228,6 +1252,12 @@ tscan_tree_reduce(as_index_ref *r_ref, void *udata)
 		if (u->si) cf_atomic64_decr(&u->si->stats.recs_pending);
 		cf_atomic_int_incr(&(u->pjob->n_obj_expired));
 		as_record_done(r_ref, u->ns);
+		if (SCAN_JOB_IS_POPULATOR(u->pjob)) {
+			uint64_t scanned = (uint64_t)cf_atomic_int_get(u->pjob->n_obj_scanned) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_set_diff) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_expired);
+			as_sindex_ticker(u->pjob->ns, u->si, scanned, u->pjob->start_time);
+		}
 		return;
 	}
 
@@ -1240,13 +1270,22 @@ tscan_tree_reduce(as_index_ref *r_ref, void *udata)
 			if (u->si) cf_atomic64_decr(&u->si->stats.recs_pending);
 			cf_atomic_int_incr(&(u->pjob->n_obj_set_diff));
 			as_record_done(r_ref, u->ns);
+			if (SCAN_JOB_IS_POPULATOR(u->pjob)) {
+				uint64_t scanned = (uint64_t)cf_atomic_int_get(u->pjob->n_obj_scanned) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_set_diff) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_expired);
+				as_sindex_ticker(u->pjob->ns, u->si, scanned, u->pjob->start_time);
+			}
 			return;
 		}
 	}
 
 	// Increment the number of objects scanned outside of all the checks for
 	// udf/si, etc.
-	uint64_t n_obj_scanned = (uint64_t)cf_atomic_int_incr(&(u->pjob->n_obj_scanned));
+	// It is important to take in account the objects from different set and expired objects
+	uint64_t n_obj_scanned = (uint64_t)cf_atomic_int_incr(&(u->pjob->n_obj_scanned)) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_set_diff) +
+							(uint64_t)cf_atomic_int_get(u->pjob->n_obj_expired);
 
 	// Execute if UDF Call is defined. UDF cannot be executed inline. The logic
 	// is to create a internal transaction.
@@ -1313,47 +1352,22 @@ tscan_tree_reduce(as_index_ref *r_ref, void *udata)
 
 		// This reduce function is called for loading data into secondary index.
 		if (SCAN_JOB_IS_POPULATOR(u->pjob)) {
+
 			if (u->si) {
 				cf_atomic64_decr(&u->si->stats.recs_pending);
+				SINDEX_GRLOCK();
+				AS_SINDEX_RESERVE(u->si);
+				SINDEX_GUNLOCK();
 				as_sindex_put_rd(u->si, &rd);
+				as_sindex_ticker(u->pjob->ns, u->si, n_obj_scanned, u->pjob->start_time);
 			} else {
 				// No input si mentioned, so go ahead and populate all of the entries.
 				// SCAN_JOB_TYPE_SINDEX_POPULATEALL case.
 				// This function will parse all the ns si's, reserve it and read the data.
 				as_sindex_putall_rd(u->ns, &rd);
+				as_sindex_ticker(u->pjob->ns, NULL, n_obj_scanned, u->pjob->start_time);
 			}
 
-			const int sindex_ticker_obj_count = 100000;
-
-			if (n_obj_scanned % sindex_ticker_obj_count == 0) {
-				// Ticker can be dumped from here, we'll be in this place for both
-				// sindex populate and populate-all.
-				char *si_name = "<all>";
-				// si memory gets set from as_sindex_reserve_data_memory() which in turn gets set from :
-				// ai_btree_put() <- for every single sindex insertion (boot-time/dynamic)
-				// as_sindex_create() : for dynamic si creation, cluster change, smd on boot-up.
-
-				uint64_t si_memory   = (uint64_t)cf_atomic_int_get(u->pjob->ns->sindex_data_memory_used);
-
-				if (u->si) {
-					si_memory   = cf_atomic64_get(u->pjob->si->data_memory_used);
-					si_name = u->pjob->si->imd->iname;
-				}
-
-				uint64_t pct_obj_scanned = (n_obj_scanned * 100) / cf_atomic_int_get(u->pjob->ns->n_objects);
-				uint64_t elapsed = (cf_getms() - u->pjob->start_time);
-				uint64_t est_time = 0;
-
-				if (pct_obj_scanned > 0) {
-					est_time = ((elapsed * 100) / (uint64_t)pct_obj_scanned) - elapsed;
-				}
-
-				cf_info(AS_SCAN, " Sindex-ticker: ns=%s si=%s obj-scanned=%"PRIu64" si-mem-used=%"PRIu64""
-						" progress=%d%% est-time=%"PRIu64" ms",
-						u->pjob->ns->name, si_name,
-						u->pjob->n_obj_scanned,
-						si_memory, pct_obj_scanned, est_time);
-			}
 		} else {
 			if (! *bb_r) {
 				*bb_r = cf_buf_builder_create_size(INITIAL_BUFBUILDER_SIZE);
@@ -1369,6 +1383,27 @@ tscan_tree_reduce(as_index_ref *r_ref, void *udata)
 	}
 
 	as_record_done(r_ref, u->ns);
+
+	if (! SCAN_JOB_IS_POPULATOR(u->pjob)) {
+		// If we exceed the proto size limit, send accumulated data back to client
+		// and reset the buf-builder to start a new proto.
+		if ((*bb_r)->used_sz > SCAN_PROTO_LIMIT) {
+			pthread_mutex_lock(&u->pjob->LOCK);
+
+			if (0 != tscan_send_response_to_client(u->pjob, (*bb_r)->buf, (*bb_r)->used_sz)) {
+				*u->aborted = true;
+			}
+
+			pthread_mutex_unlock(&u->pjob->LOCK);
+
+			cf_buf_builder_reset(*bb_r);
+		}
+
+		if (IS_SCAN_JOB_ABORTED(u->pjob)) {
+			*u->aborted = true;
+			u->pjob->result = AS_PROTO_RESULT_FAIL_SCAN_ABORT;
+		}
+	}
 
 END:
 	u->yield_count++;
@@ -1408,8 +1443,7 @@ tscan_send_response_to_client( tscan_job *job, uint8_t *buf, size_t len)
 		if (rv <= 0) {
 			if (errno != EAGAIN) {
 				cf_info(AS_SCAN, "tid %"PRIu64": scan send response error returned %d errno %d fd %d ", job->tid, rv, errno, job->fd_h->fd);
-				AS_RELEASE_FILE_HANDLE(job->fd_h);
-				job->fd_h = 0;
+				scan_release_file_handle(job);
 				return(-1);
 			}
 		}
@@ -1423,8 +1457,7 @@ tscan_send_response_to_client( tscan_job *job, uint8_t *buf, size_t len)
 		if (rv <= 0) {
 			if (errno != EAGAIN) {
 				cf_info(AS_SCAN, "tid %"PRIu64": scan send response error returned %d errno %d fd %d ", job->tid, rv, errno, job->fd_h->fd);
-				AS_RELEASE_FILE_HANDLE(job->fd_h);
-				job->fd_h = 0;
+				scan_release_file_handle(job);
 				return(-1);
 			}
 		}
@@ -1542,10 +1575,7 @@ scan_udf_job_manager(void *q_to_wait_on)
 				SCAN_JOB_PENDING_ON(job);
 				pthread_mutex_unlock(&job->LOCK);
 				// We have to keep the job around for stats, but free fd now.
-				if (job->fd_h) {
-					AS_RELEASE_FILE_HANDLE(job->fd_h);
-					job->fd_h = NULL;
-				}
+				scan_release_file_handle(job);
 				cf_queue_push(job_queue, &job);
 				goto NextElement;
 			}
@@ -1608,22 +1638,6 @@ NextElement:
 	return (0);
 }
 
-bool
-as_tscan_set_priority(uint64_t trid, uint16_t priority) {
-	tscan_job * job = NULL;
-	if (RCHASH_OK != rchash_get(g_scan_job_hash, &trid, sizeof(trid), (void **) &job)) {
-		cf_info(AS_SCAN, "Scan job with transaction id [%"PRIu64"] does not exist anymore", trid);
-		return false;
-	}
-	// Priority maps to number of threads in a job internally.
-	cf_info(AS_SCAN, "UDF: Received priority change for job [%"PRIu64"], setting number of threads to [%d]", job->tid, priority);
-	pthread_mutex_lock(&job->LOCK);
-	job->n_threads = priority;
-	pthread_mutex_unlock(&job->LOCK);
-	scan_job_release_and_destroy(job);
-	return true;
-}
-
 int
 as_tscan_abort(uint64_t trid)
 {
@@ -1638,6 +1652,28 @@ as_tscan_abort(uint64_t trid)
 	pthread_mutex_unlock(&job->LOCK);
 	scan_job_release_and_destroy(job);
 	return 0;
+}
+
+int
+abort_all_reduce_fn(void *key, uint32_t keylen, void *object, void *udata)
+{
+	tscan_job *job = (tscan_job*)object;
+	cf_info(AS_SCAN, "scan job %lu for '%s' - aborted by scan-abort-all info command",
+			job->tid, job->ns->name);
+	pthread_mutex_lock(&job->LOCK);
+	SCAN_JOB_ABORTED_ON(job);
+	pthread_mutex_unlock(&job->LOCK);
+	(*(int*)udata)++;
+
+	return CF_RCHASH_OK;
+}
+
+int
+as_tscan_abort_all()
+{
+	int num_jobs_killed = 0;
+	rchash_reduce(g_scan_job_hash, abort_all_reduce_fn, (void*)&num_jobs_killed);
+	return num_jobs_killed;
 }
 
 // For every job in the g_scan_job_hash, print the statistics.
@@ -1875,6 +1911,7 @@ tscan_partition_thr(void *q_to_wait_on)
 		u.rsv         = &rsv;
 		u.job_id      = job->tid;
 		u.pjob        = job;
+		u.aborted     = &job_early_terminate;
 
 		if (job->hasudf) {
 			cf_detail(AS_SCAN, "UDF: Scan job %"PRIu64" has udf", job->tid);
@@ -1928,10 +1965,10 @@ tscan_partition_thr(void *q_to_wait_on)
 
 				tscan_aggr_tr_udata_t tree_reduce_udata = {
 					.recl = recl,
-					.task = &u 
+					.task = &u
 				};
 
-				as_index_reduce_sync(rsv.tree, tscan_aggr_tree_reduce_fn, (void *)&tree_reduce_udata);
+				as_index_reduce(rsv.tree, tscan_aggr_tree_reduce_fn, (void *)&tree_reduce_udata);
 
 				as_result   *res    = as_result_new();
 				int ret             = as_aggr__process(u.aggr_call, recl, &u, res);

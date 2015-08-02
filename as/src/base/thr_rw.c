@@ -137,13 +137,17 @@ void print_digest(u_char *d) {
 		printf("%02x", d[i]);
 }
 
+void g_write_hash_delete(global_keyd *gk) {
+	rchash_delete(g_write_hash, gk, sizeof(global_keyd));
+}
+
 // forward references internal to the file
-void rw_complete(as_transaction *tr, as_record_lock *rl, int record_get_rv);
+void rw_complete(write_request *wr, as_transaction *tr, as_record_lock *rl, int record_get_rv);
 int write_local(as_transaction *tr, write_local_generation *wlg,
 				uint8_t **pickled_buf, size_t *pickled_sz, uint32_t *pickled_void_time,
 				as_rec_props *p_pickled_rec_props, bool journal, cf_node masternode);
 int write_journal(as_transaction *tr, write_local_generation *wlg); // only do write
-int write_delete_journal(as_transaction *tr);
+int write_delete_journal(as_transaction *tr, bool is_subrec);
 static void release_proto_fd_h(as_file_handle *proto_fd_h);
 void xdr_write(as_namespace *ns, cf_digest keyd, as_generation generation,
 			   cf_node masternode, bool is_delete, uint16_t set_id);
@@ -522,6 +526,9 @@ rw_msg_setup(msg *m, as_transaction *tr, cf_digest *keyd,
 
 		rw_msg_setup_infobits(m, tr, ldt_rectype_bits, has_udf);
 
+		// Send this along with parent packet as well. This is required
+		// in case the LDT parent replication is done without MULTI_OP.
+		// Example touch of the some other bin in the LDT parent
 		if (as_ldt_flag_has_parent(ldt_rectype_bits)) {
 			rw_msg_setup_ldt_fields(m, tr, keyd, ldt_rectype_bits);
 		}
@@ -798,7 +805,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 					&tr->keyd);
 			MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_storage_open_hist);
 			WR_TRACK_INFO(wr, "internal_rw_start: Short Circuit For Reads");
-			rw_complete(tr, &rl, rec_rv);
+			rw_complete(wr, tr, &rl, rec_rv);
 			rw_cleanup(wr, tr, first_time, false, __LINE__);
 			as_rw_set_stat_counters(true, 0, tr);
 			*delete = true;
@@ -809,7 +816,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 			//     - If duplicate are resolved
 			// send the response to requester (consumes the tr, basically)
 			WR_TRACK_INFO(wr, "internal_rw_start: Short Circuit For Reads");
-			rw_complete(tr, NULL, rec_rv);
+			rw_complete(wr, tr, NULL, rec_rv);
 			rw_cleanup(wr, tr, first_time, false, __LINE__);
 			as_rw_set_stat_counters(true, 0, tr);
 			*delete = true;
@@ -851,7 +858,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 				|| (wr->read_consistency_level == AS_POLICY_CONSISTENCY_LEVEL_ALL))) {
 			MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_internal_hist);
 			WR_TRACK_INFO(wr, "internal_rw_start: Short Circuit for Read After Duplicate Resolution");
-			rw_complete(tr, NULL, 0);
+			rw_complete(wr, tr, NULL, 0);
 			rw_cleanup(wr, tr, first_time, false, __LINE__);
 			as_rw_set_stat_counters(true, 0, tr);
 			*delete = true;
@@ -904,7 +911,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 						tr->msgp->msg.info2 |= AS_MSG_INFO2_DELETE;
 						tr->msgp->msg.info2 &= ~AS_MSG_INFO2_WRITE;
 						is_delete = true;
-					} else if (UDF_OP_IS_READ(op)) {
+					} else if (UDF_OP_IS_READ(op) || op == UDF_OPTYPE_NONE) {
 						// update stats to move from normal to uDF requests
 						as_rw_update_stat(wr);
 						// return early if the record was not updated
@@ -955,7 +962,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 				// send data back to the client and don't leak a connection
 				if (rv == -1) {
 					MICROBENCHMARK_RESET_P();
-					rw_complete(tr, NULL, 0);
+					rw_complete(wr, tr, NULL, 0);
 					rw_cleanup(wr, tr, false, false, __LINE__);
 					rv = 0;
 				}
@@ -1002,6 +1009,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 				"node %"PRIx64", with TRANSACTION_FLAG_SHIPPED_OP not set and without any cluster key "
 				"mismatch too. Cluster key is %"PRIx64", cluster size = %d my id %"PRIx64"", 
 				g_config.self_node, tr->rsv.cluster_key, g_config.paxos->cluster_size , g_config.self_node);
+			//PRINT_STACK();
 		}
 
 		if ((!qnode_found) && (tr->rsv.p->qnode != tr->rsv.p->replica[0])) {
@@ -1028,7 +1036,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 						tr->rsv.ns->name, tr->rsv.pid, *(uint64_t *) & (wr->keyd), is_delete ? "DELETE" : "UPDATE", tr->result_code);
 
 			WR_TRACK_INFO(wr, "internal_rw_start: Short Circuit for Single Replica Writes");
-			rw_complete(tr, NULL, 0);
+			rw_complete(wr, tr, NULL, 0);
 			rw_cleanup(wr, tr, first_time, false, __LINE__);
 			as_rw_set_stat_counters(false, 0, tr);
 			*delete = true;
@@ -1081,7 +1089,7 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 		// signal back to client
 		cf_debug(AS_RW, "respond_client_on_master_completion");
 		wr->respond_client_on_master_completion = true;
-		rw_complete(tr, NULL, 0);
+		rw_complete(wr, tr, NULL, 0);
 		tr->proto_fd_h = NULL;
 		tr->proxy_msg = NULL;
 		UREQ_DATA_RESET(&wr->udata);
@@ -1177,20 +1185,37 @@ internal_rw_start(as_transaction *tr, write_request *wr, bool *delete)
 
 int as_rw_start(as_transaction *tr, bool is_read) {
 	int rv;
+	as_namespace *ns = tr->rsv.ns;
 
 	cf_assert(tr, AS_RW, CF_CRITICAL, "invalid transaction");
 	cf_assert(tr->rsv.p, AS_RW, CF_CRITICAL, "invalid reservation");
-	cf_assert(tr->rsv.ns, AS_RW, CF_CRITICAL,
+	cf_assert(ns, AS_RW, CF_CRITICAL,
 			"invalid reservation");
-	cf_assert(tr->rsv.ns->name, AS_RW, CF_CRITICAL,
+	cf_assert(ns->name, AS_RW, CF_CRITICAL,
 			"invalid reservation");
 
 	if (! is_read) {
 		// If we're doing a "real" write, check that we aren't backed up.
 		if ((tr->msgp->msg.info2 & AS_MSG_INFO2_DELETE) == 0 &&
-				as_storage_overloaded(tr->rsv.ns)) {
+				as_storage_overloaded(ns)) {
 			tr->result_code = AS_PROTO_RESULT_FAIL_DEVICE_OVERLOAD;
 			return -1;
+		}
+
+		if ((tr->msgp->msg.info1 & AS_MSG_INFO1_XDR)) {
+			if (ns->ns_allow_xdr_writes == false) {
+				tr->result_code = AS_PROTO_RESULT_FAIL_FORBIDDEN;
+				cf_atomic_int_incr(&g_config.err_write_fail_forbidden);
+				cf_debug(AS_RW, "Disallowing xdr write in namespace %s", ns->name);
+				return -1;
+			}
+		} else {
+			if (ns->ns_allow_nonxdr_writes == false) {
+				tr->result_code = AS_PROTO_RESULT_FAIL_FORBIDDEN;
+				cf_atomic_int_incr(&g_config.err_write_fail_forbidden);
+				cf_debug(AS_RW, "Disallowing non-xdr write in namespace %s", ns->name);
+				return -1;
+			}
 		}
 	}
 
@@ -1202,7 +1227,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 	wr->dupl_trans_complete = (tr->rsv.n_dupl > 0) ? 0 : 1;
 
 	cf_debug_digest(AS_RW, &(tr->keyd), "[PROCESS KEY] {%s:%u} Self(%"PRIx64") Read(%d):",
-			tr->rsv. ns->name, tr->rsv.p->partition_id, g_config.self_node, is_read );
+			ns->name, tr->rsv.p->partition_id, g_config.self_node, is_read );
 
 	wr->keyd = tr->keyd;
 
@@ -1214,7 +1239,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 
 	// Fetching the write_request out of the hash table
 	global_keyd gk;
-	gk.ns_id = tr->rsv.ns->id;
+	gk.ns_id = ns->id;
 	gk.keyd = tr->keyd;
 
 	cf_rc_reserve(wr); // need to keep an extra reference count in case it inserts
@@ -1232,7 +1257,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 
 					cf_debug(AS_RW,
 							"proxy_write_start: duplicate, ignoring {%s:%d} %"PRIx64"",
-							tr->rsv.ns->name, tr->rsv.pid, *(uint64_t*)&tr->keyd);
+							ns->name, tr->rsv.pid, *(uint64_t*)&tr->keyd);
 					cf_rc_release(wr);
 					WR_TRACK_INFO(wr, "as_rw_start: proxy - ignored");
 					WR_RELEASE(wr);
@@ -1258,7 +1283,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 				if (wq_depth > g_config.transaction_pending_limit) {
 					cf_debug(AS_RW,
 							"as_rw_start: pending limit, ignoring {%s:%d} %"PRIx64"",
-							tr->rsv.ns->name, tr->rsv.pid, *(uint64_t*)&tr->keyd);
+							ns->name, tr->rsv.pid, *(uint64_t*)&tr->keyd);
 					cf_rc_release(wr);
 					WR_TRACK_INFO(wr, "as_rw_start: pending - limit");
 					WR_RELEASE(wr);
@@ -1304,9 +1329,9 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 
 			cf_atomic_int_incr(&g_config.n_waiting_transactions);
 
-			cf_detail(AS_RW,
-					"as rw start:  write in progress QUEUEING returning 0 (%d:%p) %"PRIx64"",
-					tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, *(uint64_t*)&tr->keyd);
+			cf_detail_digest(AS_RW, &tr->keyd,
+					"as rw start:  write in progress QUEUEING returning 0 (%d:%p:%"PRIx64") wr(%p) %ld",
+					tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, tr->proxy_node, wr2, tr->trid);
 
 			as_partition_release(&tr->rsv);
 			cf_atomic_int_decr(&g_config.rw_tree_count);
@@ -1319,7 +1344,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 			WR_TRACK_INFO(wr, "as_rw_start: not found: return -2");
 			cf_detail(AS_RW,
 					"as rw start:  could not find request in hash table! returning -2 {%s.%d} (%d:%p) %"PRIx64"",
-					tr->rsv.ns->name, tr->rsv.pid, tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, *(uint64_t*)&tr->keyd);
+					ns->name, tr->rsv.pid, tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, *(uint64_t*)&tr->keyd);
 		}
 		cf_rc_release(wr);
 		WR_TRACK_INFO(wr, "as_rw_start: 694");
@@ -1329,7 +1354,7 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 	else if (rv != 0) {
 		cf_info(AS_RW,
 				"as_write_start:  unknown reason %d can't put unique? {%s.%d} (%d:%p) %"PRIx64"",
-				rv, tr->rsv.ns->name, tr->rsv.pid, tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, *(uint64_t*)&tr->keyd);
+				rv, ns->name, tr->rsv.pid, tr->proto_fd_h ? tr->proto_fd_h->fd : 0, tr->proxy_msg, *(uint64_t*)&tr->keyd);
 		WR_TRACK_INFO(wr, "as_rw_start: 701");
 		udf_rw_complete(tr, -2, __FILE__, __LINE__);
 		UREQ_DATA_RESET(&tr->udata);
@@ -1351,13 +1376,13 @@ int as_rw_start(as_transaction *tr, bool is_read) {
 	}
 
 	cf_detail(AS_RW, "{%s:%d} as_rw_start: CREATING request %"PRIx64" %s",
-			tr->rsv.ns->name, tr->rsv.pid, *(uint64_t *) & (wr->keyd), wr->is_read ? "READ" : "WRITE");
+			ns->name, tr->rsv.pid, *(uint64_t *) & (wr->keyd), wr->is_read ? "READ" : "WRITE");
 
 	// this is debug print code --- stash a copy of the ns name + pid allowing
 	// printing after we've sent the wr on its way
 	char str[6];
 	memset(str, 0, 6);
-	strncpy(str, tr->rsv.ns->name, 5);
+	strncpy(str, ns->name, 5);
 	int pid = tr->rsv.pid;
 
 	pthread_mutex_lock(&wr->lock);
@@ -1413,7 +1438,7 @@ int as_read_start(as_transaction *tr) {
 			cf_atomic_int_incr(&g_config.stat_read_reqs_xdr);
 		}
 
-		rw_complete(tr, NULL, 0);
+		rw_complete(NULL, tr, NULL, 0);
 
 		// This code does task of rw_cleanup ... like releasing
 		// reservation cleaning up msgp etc ...
@@ -1468,6 +1493,7 @@ void rw_msg_get_ldt_dupinfo(as_record_merge_component *c, msg *m) {
 int
 finish_rw_process_prole_ack(write_request *wr, uint32_t result_code)
 {
+    cf_debug(AS_RW, "Prole Ack");
 	if (wr->shipped_op) {
 		cf_detail_digest(AS_RW, &wr->keyd, "SHIPPED_OP WINNER [Digest %"PRIx64"] Replication Done",
 				*(uint64_t *)&wr->keyd);
@@ -1519,7 +1545,7 @@ finish_rw_process_prole_ack(write_request *wr, uint32_t result_code)
 	tr.microbenchmark_is_resolve = false;
 
 	if (!wr->respond_client_on_master_completion) {
-		rw_complete(&tr, NULL, 0);
+		rw_complete(wr, &tr, NULL, 0);
 		rw_cleanup(wr, &tr, false, false, __LINE__);
 	}
 
@@ -1987,19 +2013,51 @@ Out:
 
 } // end rw_process_ack()
 
+void
+write_complete(write_request *wr, as_transaction *tr)
+{
+	(void)wr; // to be used by new code in unwind branch
+
+	if (udf_rw_needcomplete(tr)) {
+		udf_rw_complete(tr, tr->result_code, __FILE__, __LINE__);
+	}
+	else if (tr->proto_fd_h) {
+		if (0 != as_msg_send_reply(tr->proto_fd_h, tr->result_code,
+				tr->generation, 0, NULL, NULL, 0, NULL, NULL, tr->trid, NULL)) {
+			cf_warning(AS_RW, "can't send reply to client, fd %d",
+					tr->proto_fd_h->fd);
+		}
+
+		cf_hist_track_insert_data_point(g_config.wt_reply_hist, tr->start_time);
+
+		tr->proto_fd_h = 0;
+	}
+	else if (tr->proxy_msg) {
+		as_proxy_send_response(tr->proxy_node, tr->proxy_msg, tr->result_code,
+				0, 0, NULL, NULL, 0, NULL, tr->trid, NULL);
+	}
+	// else something is really wrong ...
+
+	MICROBENCHMARK_HIST_INSERT_P(wt_net_hist);
+}
+
 /*
  * Complete the request. Respond back to the requester, which is either 
  * client or proxy source node. Also free the proto. This is done to avoid
  * any futher communication. 
  */
-void 
-rw_complete(as_transaction *tr, as_record_lock *rl, int record_get_rv) 
+void
+rw_complete(write_request *wr, as_transaction *tr, as_record_lock *rl, int record_get_rv)
 {
-	int rv;
-	cf_detail(AS_RW, "write complete!");
+	as_msg *m = &tr->msgp->msg;
 
-	if (0 != (rv = thr_tsvc_read(tr, rl, record_get_rv)))
-		cf_crash(AS_RW, "committed write can't respond: rv %d", rv);
+	if (m->info1 & AS_MSG_INFO1_READ) {
+		thr_tsvc_read(tr, rl, record_get_rv);
+	}
+	else {
+		write_complete(wr, tr);
+	}
+
 	if (tr->proto_fd_h != 0) {
 		AS_RELEASE_FILE_HANDLE(tr->proto_fd_h);
 		tr->proto_fd_h = 0;
@@ -2385,9 +2443,6 @@ write_local_pickled(cf_digest *keyd, as_partition_reservation *rsv,
 		} 
 	}
 
-	// Set the version in subrec digest if need be.
-	as_ldt_set_prole_subrec_version(keyd, rsv, linfo, info);
-
 	int rv      = as_record_get_create(tree, keyd, &r_ref, rsv->ns, is_subrec);
 	as_index *r = r_ref.r;
 
@@ -2459,16 +2514,19 @@ write_local_pickled(cf_digest *keyd, as_partition_reservation *rsv,
 	}
 
 	uint64_t version_to_set = 0;
+    bool     set_version    = false;
 	// Set the ldt prole version if there be need
 	if (is_ldt_parent) {
 		if (linfo->replication_partition_version_match && linfo->ldt_prole_version_set) {
 			version_to_set = linfo->ldt_prole_version;
+			set_version    = true;
 		} else if (!linfo->replication_partition_version_match) {
 			version_to_set = linfo->ldt_source_version;
-		}
+			set_version    = true;
+		} 
 	}
 
-	if (version_to_set) {
+	if (set_version) {
 		int pbytes = as_ldt_parent_storage_set_version(&rd, version_to_set, p_stack_particles, __FILE__, __LINE__);
 		if (pbytes < 0) {
 			cf_warning(AS_LDT, "write_local_pickled: LDT Parent storage version set failed %d", pbytes);
@@ -2476,7 +2534,8 @@ write_local_pickled(cf_digest *keyd, as_partition_reservation *rsv,
 		} else {
 			p_stack_particles += pbytes;
 		}
-		cf_detail_digest(AS_LDT, keyd, "Wrote the destination version %d %d %ld", linfo->replication_partition_version_match, linfo->ldt_prole_version_set, linfo->ldt_prole_version);
+		cf_detail_digest(AS_LDT, keyd, "Wrote the destination version match %s set version (%ld) out of prole (%d:%ld) source(%ld)", 
+						linfo->replication_partition_version_match ? "true" : "false", version_to_set, linfo->ldt_prole_version_set, linfo->ldt_prole_version, linfo->ldt_source_version);
 	}
 
 Out:
@@ -2519,7 +2578,8 @@ Out:
 	return (0);
 }
 
-int as_rw_get_ldt_info(ldt_prole_info *linfo, msg *m, as_partition_reservation *rsv) 
+int
+as_rw_get_ldt_info(ldt_prole_info *linfo, msg *m, as_partition_reservation *rsv) 
 {
 	linfo->ldt_source_version = 0;
 	linfo->ldt_prole_version_set = false;
@@ -2664,7 +2724,6 @@ write_process(cf_node node, msg *m, bool respond)
 		}
 
 		if( tr.rsv.state == AS_PARTITION_STATE_ABSENT ||
-			tr.rsv.state == AS_PARTITION_STATE_LIFESUPPORT ||
 			tr.rsv.state == AS_PARTITION_STATE_WAIT)
 		{
 			cf_debug_digest(AS_RW, keyd, "[PROLE STATE MISMATCH:1] TID(0) Partition PID(%u) State is Absent or other(%u). Return to Sender.",
@@ -2792,7 +2851,6 @@ write_process(cf_node node, msg *m, bool respond)
 		// If so, then DO NOT WRITE.  Instead, return an error so that the
 		// Master will retry with the correct node.
 		if (rsv.state == AS_PARTITION_STATE_ABSENT ||
-			rsv.state == AS_PARTITION_STATE_LIFESUPPORT ||
 			rsv.state == AS_PARTITION_STATE_WAIT)
 		{
 			result_code = AS_PROTO_RESULT_FAIL_CLUSTER_KEY_MISMATCH;
@@ -2912,10 +2970,14 @@ write_delete_local(as_transaction *tr, bool journal, cf_node masternode,
 		if (AS_PARTITION_STATE_DESYNC != tr->rsv.state)
 			cf_debug(AS_RW, "journal delete: unusual state %d",
 					(int)tr->rsv.state);
-		write_delete_journal(tr);
+		if (tr->flag & AS_TRANSACTION_FLAG_LDT_SUB) {
+			cf_detail_digest(AS_LDT, &tr->keyd, "LDT Subrecord journalling and skipping %"PRIx64"\n");
+		}
+
+		write_delete_journal(tr, (tr->flag & AS_TRANSACTION_FLAG_LDT_SUB));
 		return (0);
 	} else if (AS_PARTITION_STATE_DESYNC == tr->rsv.state) {
-		cf_debug(AS_RW,
+		cf_detail(AS_RW,
 				"{%s:%d} write_delete_local: partition is desync - writes will flow from master",
 				ns->name, tr->rsv.pid);
 		return (0);
@@ -2937,6 +2999,10 @@ write_delete_local(as_transaction *tr, bool journal, cf_node masternode,
 
 	if (0 != as_record_get(tree, &tr->keyd, &r_ref, ns)) {
 		tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
+
+		if (tr->flag & AS_TRANSACTION_FLAG_LDT_SUB) {
+			cf_detail_digest(AS_LDT, &tr->keyd,  "LDT Subrecord Delete Request did not find record %"PRIx64"\n");
+		}
 		return -1;
 	}
 
@@ -2948,6 +3014,10 @@ write_delete_local(as_transaction *tr, bool journal, cf_node masternode,
 			 ((m->info2 & AS_MSG_INFO2_GENERATION_GT) && m->generation <= r->generation))) {
 		as_record_done(&r_ref, ns);
 		tr->result_code = AS_PROTO_RESULT_FAIL_GENERATION;
+		if (tr->flag & AS_TRANSACTION_FLAG_LDT_SUB) {
+			cf_detail_digest(AS_LDT, &tr->keyd, "LDT Subrecord Delete Request gen check failed %"PRIx64"\n");
+		}
+
 		return -1;
 	}
 
@@ -2978,28 +3048,25 @@ write_delete_local(as_transaction *tr, bool journal, cf_node masternode,
 			// cleaned up by background sindex defrag thread.
 			if (as_sindex_ns_has_sindex(ns)) {
 				int sindex_ret = AS_SINDEX_OK;
-				int oldbin_cnt = 0;
 				const char* set_name = as_index_get_set_name(r, ns);
 
 				SINDEX_GRLOCK();
-				int sindex_bins = (ns->sindex_cnt < rd.n_bins) ? ns->sindex_cnt : rd.n_bins;
-				SINDEX_BINS_SETUP(oldbin, sindex_bins); 
+				SINDEX_BINS_SETUP(sbins, ns->sindex_cnt);
+				int sindex_found = 0;
 				for (int i = 0; i < rd.n_bins; i++) {
-					sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-							&rd.bins[i], &oldbin[oldbin_cnt]);
-					if (AS_SINDEX_OK == sindex_ret)
-						oldbin_cnt++;
+					sindex_found += as_sindex_sbins_from_bin(ns, set_name, &rd.bins[i], &sbins[sindex_found], AS_SINDEX_OP_DELETE);
 				}
 				SINDEX_GUNLOCK();
 
-				GTRACE(CALLER, debug,
+				cf_debug(AS_SINDEX,
 						"Delete @ %s %d digest %ld", __FILE__, __LINE__, *(uint64_t *)&rd.keyd);
-				sindex_ret = as_sindex_delete_by_sbin(ns, set_name,
-						oldbin_cnt, oldbin, &rd);
+				if (sindex_found) {
+					sindex_ret = as_sindex_update_by_sbin(ns, set_name, sbins, sindex_found, &rd.keyd);
+					as_sindex_sbin_freeall(sbins, sindex_found);
+				}
 				if (sindex_ret != AS_SINDEX_OK)
-					GTRACE(CALLER, debug,
+					cf_debug(AS_SINDEX,
 							"Failed: %d", as_sindex_err_str(sindex_ret));
-				as_sindex_sbin_freeall(oldbin, oldbin_cnt);
 			}
 		}
 
@@ -4082,18 +4149,16 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 	op = 0;
 	i = 0;
 
-	uint16_t max_oldbins = as_bin_inuse_count(&rd);
-	int sindex_ret = AS_SINDEX_OK;
-	int oldbin_cnt = 0;
-	int newbin_cnt = 0;
+	int sindex_ret       = AS_SINDEX_OK;
+	int sindex_found     = 0;
 
 	if (has_sindex) {
 		SINDEX_GRLOCK();
 	}
-	int sindex_old_bins = ( ns->sindex_cnt < max_oldbins ) ? ns->sindex_cnt : max_oldbins;
-	int sindex_new_bins = ( ns->sindex_cnt < m->n_ops ) ? ns->sindex_cnt : m->n_ops;
-	SINDEX_BINS_SETUP(oldbin, sindex_old_bins);
-	SINDEX_BINS_SETUP(newbin, sindex_new_bins);
+
+	// Maximum number of sindexes which can be changed in one transaction
+	// is 2 * ns->sindex_cnt
+	SINDEX_BINS_SETUP(sbins, 2 * ns->sindex_cnt);
 	// If existing bins are loaded in rd.bins, it's easiest for record-level
 	// replace to delete them all and add new ones fresh.
 	if (replace_deletes_bins) {
@@ -4103,16 +4168,9 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 			for (uint16_t i = 0; i < rd.n_bins; i++) {
 				if (! as_bin_inuse(&rd.bins[i])) {
 					break;
-				}
-
-				sindex_ret = as_sindex_sbin_from_bin(ns, set_name, &rd.bins[i], &oldbin[oldbin_cnt]);
-
-				if (sindex_ret == AS_SINDEX_OK) {
-					oldbin_cnt++;
-				}
-				else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-					GTRACE(CALLER, debug, "failed to get sbin with error %d", sindex_ret);
-				}
+				}	
+				sindex_found += as_sindex_sbins_from_bin(ns, set_name, &rd.bins[i], 
+						&sbins[sindex_found], AS_SINDEX_OP_DELETE);
 			}
 		}
 
@@ -4138,12 +4196,8 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 					int32_t i = as_bin_get_index(&rd, op->name, op->name_sz);
 					if (i != -1) {
 						if (has_sindex) {
-							sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-									&rd.bins[i], &oldbin[oldbin_cnt]);
-							if (sindex_ret == AS_SINDEX_OK) oldbin_cnt++;
-							else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-								GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-							}
+							sindex_found += as_sindex_sbins_from_bin(ns, set_name, &rd.bins[i], 
+									&sbins[sindex_found], AS_SINDEX_OP_DELETE);
 						}
 						as_bin_destroy(&rd, i);
 						rd.write_to_device = true;
@@ -4164,16 +4218,14 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 
 				if (b) {
 					uint32_t value_sz = as_msg_op_get_value_sz(op);
-					bool check_update = false;
-					if (has_sindex && !is_create) {
-						sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-								b, &oldbin[oldbin_cnt]);
-						if (sindex_ret == AS_SINDEX_OK) {
-							check_update = true;
-							oldbin_cnt++;
+					if (has_sindex) {
+						if (!is_create) {
+							sindex_found += as_sindex_diff_sbins_from_buf(ns, set_name, b, 
+									as_msg_op_get_value_p(op), value_sz, op->particle_type, &sbins[sindex_found]);
 						}
-						else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-							GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
+						else {
+							sindex_found += as_sindex_sbins_from_buf(ns, set_name, b, &sbins[sindex_found], 
+										as_msg_op_get_value_p(op), value_sz, op->particle_type, AS_SINDEX_OP_INSERT);
 						}
 					}
 					as_particle_frombuf(b, op->particle_type,
@@ -4184,30 +4236,7 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 					if (! ns->storage_data_in_memory && op->particle_type != AS_PARTICLE_TYPE_INTEGER) {
 						p_stack_particles += as_particle_get_base_size(op->particle_type) + value_sz;
 					}
-					if (has_sindex) {
-						sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-								b, &newbin[newbin_cnt]);
-						if (sindex_ret == AS_SINDEX_OK) {
-							newbin_cnt++;
-						}
-						else {
-							check_update = false;
-							if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-								GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-							}
-						}
-					}
 
-					//  if the values is updated; then check if both the values are same
-					//  if they are make it a no-op
-					if (has_sindex && check_update && newbin_cnt > 0 && oldbin_cnt > 0) {
-						if (as_sindex_sbin_match(&newbin[newbin_cnt - 1], &oldbin[oldbin_cnt - 1])) {
-							as_sindex_sbin_free(&newbin[newbin_cnt - 1]);
-							as_sindex_sbin_free(&oldbin[oldbin_cnt - 1]);
-							oldbin_cnt--;
-							newbin_cnt--;
-						}
-					}
 					rd.write_to_device = true;
 				}
 				else {
@@ -4258,12 +4287,7 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 						p_stack_particles += as_particle_get_base_size(particle_type) + value_sz;
 					}
 					if (has_sindex) {
-						sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-								b, &newbin[newbin_cnt]);
-						if (sindex_ret == AS_SINDEX_OK)  newbin_cnt++;
-						else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-							GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-						}
+						sindex_found += as_sindex_sbins_from_bin(ns, set_name, b, &sbins[sindex_found], AS_SINDEX_OP_INSERT);
 					}
 					rd.write_to_device = true;
 				}
@@ -4273,30 +4297,21 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 				case AS_MSG_OP_MC_INCR:
 				case AS_MSG_OP_INCR:
 				{
+					int sindex_found_yet = sindex_found;
 					if (has_sindex) {
-						sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-								b, &oldbin[oldbin_cnt]);
-						if (sindex_ret == AS_SINDEX_OK) oldbin_cnt++;
-						else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-							GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-						}
+						sindex_found += as_sindex_sbins_from_bin(ns, set_name, b, &sbins[sindex_found], AS_SINDEX_OP_DELETE);
 					}
 					int modify_ret = as_particle_increment(b, AS_PARTICLE_TYPE_INTEGER, p_op_value, value_sz, op->op == AS_MSG_OP_MC_INCR);
 					if (modify_ret == 0) {
 						if (has_sindex) {
-							sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-									b, &newbin[newbin_cnt]);
-							if (sindex_ret == AS_SINDEX_OK) newbin_cnt++;
-							else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-								GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-							}
+							sindex_found += as_sindex_sbins_from_bin(ns, set_name, b, &sbins[sindex_found], AS_SINDEX_OP_INSERT);
 						}
 						rd.write_to_device = true;
 					}
 					else if (modify_ret == -2 && op->op == AS_MSG_OP_MC_INCR) {
 						if (has_sindex) {
-							as_sindex_sbin_free(&oldbin[oldbin_cnt - 1]);
-							oldbin_cnt--;
+							as_sindex_sbin_freeall(&sbins[sindex_found_yet], sindex_found - sindex_found_yet);
+							sindex_found = sindex_found_yet;
 						}
 					}
 					break;
@@ -4311,13 +4326,9 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 						b->particle = (as_particle*)p_stack_particles;
 					}
 
+					int sindex_found_yet = sindex_found;
 					if (has_sindex) {
-						sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-								b, &oldbin[oldbin_cnt]);
-						if (sindex_ret == AS_SINDEX_OK) oldbin_cnt++;
-						else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-							GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-						}
+						sindex_found += as_sindex_sbins_from_bin(ns, set_name, b, &sbins[sindex_found], AS_SINDEX_OP_DELETE);
 					}
 
 					// Append or prepend the data
@@ -4330,18 +4341,13 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 							p_stack_particles += as_particle_get_size_in_memory(b, b->particle);
 						}
 						if (has_sindex) {
-							sindex_ret = as_sindex_sbin_from_bin(ns, set_name,
-									b, &newbin[newbin_cnt]);
-							if (sindex_ret == AS_SINDEX_OK) newbin_cnt++;
-							else if (sindex_ret != AS_SINDEX_ERR_NOTFOUND) {
-								GTRACE(CALLER, debug, "Failed to get sbin with error %d", sindex_ret);
-							}
+							sindex_found += as_sindex_sbins_from_bin(ns, set_name, b, &sbins[sindex_found], AS_SINDEX_OP_INSERT);
 						}
 					} else {
 						// operation failed set to invalid
 						if (has_sindex) {
-							as_sindex_sbin_free(&oldbin[oldbin_cnt - 1]);
-							oldbin_cnt--;
+							as_sindex_sbin_freeall(&sbins[sindex_found_yet], sindex_found - sindex_found_yet);
+							sindex_found = sindex_found_yet;
 						}
 					}
 					break;
@@ -4407,27 +4413,16 @@ write_local(as_transaction *tr, write_local_generation *wlg,
 	uint64_t start_ns = 0;
 
 	if (has_sindex) {
-
-		if (oldbin_cnt || newbin_cnt) {
+		if (sindex_found) {
 			tr->flag |= AS_TRANSACTION_FLAG_SINDEX_TOUCHED;
 			if (g_config.microbenchmarks) {
 				start_ns = cf_getns();
 			}
-		}
-		// delete should precede insert
-		GTRACE(CALLER, debug, "Delete bin count = %d, Inserted bin count = %d at %s", oldbin_cnt, newbin_cnt, journal ? "prole" : "master");
-		if (oldbin_cnt) {
-			GTRACE(CALLER, debug, "Delete @ %s %d digest %ld", __FILE__, __LINE__, *(uint64_t*)&rd.keyd);
-			sindex_ret = as_sindex_delete_by_sbin(ns, set_name, oldbin_cnt, oldbin, &rd);
-			as_sindex_sbin_freeall(oldbin, oldbin_cnt);
-		}
-		if (newbin_cnt) {
-			GTRACE(CALLER, debug, "Insert @ %s %d digest %ld", __FILE__, __LINE__, *(uint64_t*)&rd.keyd);
-			sindex_ret = as_sindex_put_by_sbin(ns, set_name, newbin_cnt, newbin, &rd);
-			as_sindex_sbin_freeall(newbin, newbin_cnt);
-		}
-		if (g_config.microbenchmarks && start_ns && (oldbin_cnt || newbin_cnt)) {
-			histogram_insert_data_point(g_config.write_sindex_hist, start_ns);
+			sindex_ret = as_sindex_update_by_sbin(ns, set_name, sbins, sindex_found, &rd.keyd);
+			as_sindex_sbin_freeall(sbins, sindex_found);
+			if (g_config.microbenchmarks && start_ns) {
+				histogram_insert_data_point(g_config.write_sindex_hist, start_ns);
+			}
 		}
 	}
 
@@ -4504,6 +4499,7 @@ typedef struct {
 	cl_msg *msgp; // data to write
 	bool delete; // or a delete flag if it's a delete
 	write_local_generation wlg;
+	bool is_subrec;
 } journal_queue_element;
 
 //
@@ -4536,6 +4532,7 @@ int write_journal(as_transaction *tr, write_local_generation *wlg) {
 	jqe.msgp = cf_malloc(sizeof(as_proto) + tr->msgp->proto.sz);
 	memcpy(jqe.msgp, tr->msgp, sizeof(as_proto) + tr->msgp->proto.sz);
 	jqe.delete = false;
+	jqe.is_subrec = false;
 	jqe.wlg = *wlg;
 
 	journal_hash_key jhk;
@@ -4592,7 +4589,7 @@ int write_journal(as_transaction *tr, write_local_generation *wlg) {
 // Write into the journal a "delete" element
 //
 
-int write_delete_journal(as_transaction *tr) {
+int write_delete_journal(as_transaction *tr, bool is_subrec) {
 	cf_detail(AS_RW, "write to delete journal: %"PRIx64"", *(uint64_t*)&tr->keyd);
 
 	if (journal_hash == 0)
@@ -4604,6 +4601,7 @@ int write_delete_journal(as_transaction *tr) {
 	jqe.digest = tr->keyd;
 	jqe.msgp = 0;
 	jqe.delete = true;
+	jqe.is_subrec = is_subrec;
 
 	journal_hash_key jhk;
 	jhk.ns_id = jqe.ns->id;
@@ -4737,9 +4735,12 @@ int as_write_journal_apply(as_partition_reservation *prsv) {
 #endif
 
 		int rv;
+		if (jqe.is_subrec) {
+			tr.flag |= AS_TRANSACTION_FLAG_LDT_SUB;
+		}
 		if (jqe.delete == true)
 			rv = write_delete_local(&tr, false, 0, false);
-		else
+		else 
 			rv = write_local(&tr, &jqe.wlg, 0, 0, 0, 0, false, 0);
 
 		cf_detail(AS_RW, "write journal: wrote: rv %d key %"PRIx64,
@@ -4756,51 +4757,25 @@ int as_write_journal_apply(as_partition_reservation *prsv) {
 }
 
 int
-write_process_op(as_namespace *ns, cf_digest *keyd, cl_msg *msgp,
-		as_partition_reservation *rsvp, cf_node node, as_generation generation)
+write_process_op(as_transaction *tr, cl_msg *msgp, cf_node node, as_generation generation)
 {
-	// INIT_TR
-	as_transaction tr;
-	as_transaction_init(&tr, keyd, msgp);
-
-	tr.rsv = *rsvp;
-
-	// Check here if this is prole delete caused by nsup
-	// If yes we need to tell XDR not to ship the delete
-	uint32_t info = msgp->msg.info1;
-	if (info & RW_INFO_NSUP_DELETE) {
-		tr.flag |= AS_TRANSACTION_FLAG_NSUP_DELETE;
-	}
-
-	if (ns->ldt_enabled) {
-		if ((info & RW_INFO_LDT_SUBREC)
-				|| (info & RW_INFO_LDT_ESR)) {
-			tr.flag |= AS_TRANSACTION_FLAG_LDT_SUB;
-			cf_detail(AS_RW,
-					"LDT Subrecord Replication Request Received %"PRIx64"\n",
-					*(uint64_t* )keyd);
-		}
-	}
-	if (info & RW_INFO_UDF_WRITE) {
-		cf_atomic_int_incr(&g_config.udf_replica_writes);
-	}
-
+	as_namespace *ns = tr->rsv.ns;
 	int rv = 0;
 	if (msgp->msg.info2 & AS_MSG_INFO2_DELETE) {
-		rv = write_delete_local(&tr, true, node, false);
+		rv = write_delete_local(tr, true, node, false);
 	} else if (generation == 0) {
 		write_local_generation wlg;
 		wlg.use_gen_check = false;
 		wlg.use_gen_set = false;
 		wlg.use_msg_gen = false;
-		rv = write_local(&tr, &wlg, 0, 0, 0, 0, true, node);
+		rv = write_local(tr, &wlg, 0, 0, 0, 0, true, node);
 	} else if (true == ns->single_bin) {
 		write_local_generation wlg;
 		wlg.use_gen_check = false;
 		wlg.use_gen_set = true;
 		wlg.gen_set = generation;
 		wlg.use_msg_gen = false;
-		rv = write_local(&tr, &wlg, 0, 0, 0, 0, true, node);
+		rv = write_local(tr, &wlg, 0, 0, 0, 0, true, node);
 	} else {
 		write_local_generation wlg;
 		if (generation) {
@@ -4811,31 +4786,30 @@ write_process_op(as_namespace *ns, cf_digest *keyd, cl_msg *msgp,
 		}
 		wlg.use_gen_set = false;
 		wlg.use_msg_gen = false;
-		rv = write_local(&tr, &wlg, 0, 0, 0, 0, true, node);
+		rv = write_local(tr, &wlg, 0, 0, 0, 0, true, node);
 	}
 
 	if (rv == 0) {
-		tr.result_code = 0;
+		tr->result_code = 0;
 	} else {
 		// TODO: Handle case when its a Replace operation in write_local,
 		// it also returns AS_PROTO_RESULT_FAIL_NOTFOUND
-		if ((tr.result_code == AS_PROTO_RESULT_FAIL_NOTFOUND)
+		if ((tr->result_code == AS_PROTO_RESULT_FAIL_NOTFOUND)
 				&& (msgp->msg.info2 & AS_MSG_INFO2_DELETE)) {
 			cf_atomic_int_incr(&g_config.err_write_fail_prole_delete);
 		} else {
 			cf_info(AS_RW,
 					"rw prole operation: failed, ns %s rv %d result code %d, "
 					"digest %"PRIx64"",
-					ns->name, rv, tr.result_code, *(uint64_t*)&tr.keyd);
+					ns->name, rv, tr->result_code, *(uint64_t*)&tr->keyd);
 		}
 	}
 
-	return tr.result_code;
+	return tr->result_code;
 }
 
 int
-write_process_new(cf_node node, msg *m, as_partition_reservation *rsvp,
-		bool f_respond, ldt_prole_info *linfo)
+write_process_new(cf_node node, msg *m, as_partition_reservation *rsvp, bool f_respond)
 {
 	uint32_t result_code = AS_PROTO_RESULT_FAIL_UNKNOWN;
 	bool local_reserve = false;
@@ -4935,11 +4909,25 @@ write_process_new(cf_node node, msg *m, as_partition_reservation *rsvp,
 
 	as_namespace *ns = rsvp->ns;
 
-	if (as_ldt_check_and_get_prole_version(keyd, rsvp, linfo, info, NULL, false, __FILE__, __LINE__)) {
+	ldt_prole_info linfo;
+
+	if ((info & RW_INFO_LDT) && as_rw_get_ldt_info(&linfo, m, rsvp)) {
+		cf_warning(AS_LDT, "Could not find ldt info at prole");
+		return AS_PROTO_RESULT_FAIL_UNKNOWN;
+	}
+		
+	if (as_ldt_check_and_get_prole_version(keyd, rsvp, &linfo, info, NULL, false, __FILE__, __LINE__)) {
 		// If parent cannot be due to incoming migration it is ok
 		// continue and allow subrecords to be replicated
 		result_code = AS_PROTO_RESULT_OK;
 		goto Out;
+	}
+
+	// Set the version in subrec digest if need be.
+	as_ldt_set_prole_subrec_version(keyd, rsvp, &linfo, info);
+
+	if (info & RW_INFO_UDF_WRITE) {
+		cf_atomic_int_incr(&g_config.udf_replica_writes);
 	}
 
 	// Two ways to tell a prole to write something -
@@ -4953,10 +4941,32 @@ write_process_new(cf_node node, msg *m, as_partition_reservation *rsvp,
 	// the entire record) is sent and the node simply overwrites it.
 	int rv = 0;
 	if (msgp) {
-		result_code = write_process_op(ns, keyd, msgp, rsvp, node, generation);
+		// INIT_TR
+		as_transaction tr;
+		as_transaction_init(&tr, keyd, msgp);
+
+		tr.rsv = *rsvp;
+
+		// Check here if this is prole delete caused by nsup
+		// If yes we need to tell XDR not to ship the delete
+		if (info & RW_INFO_NSUP_DELETE) {
+			tr.flag |= AS_TRANSACTION_FLAG_NSUP_DELETE;
+		}
+
+		if (ns->ldt_enabled) {
+			if ((info & RW_INFO_LDT_SUBREC)
+					|| (info & RW_INFO_LDT_ESR)) {
+				tr.flag |= AS_TRANSACTION_FLAG_LDT_SUB;
+				cf_detail(AS_RW,
+						"LDT Subrecord Replication Request Received %"PRIx64"\n",
+						*(uint64_t* )keyd);
+			}
+		}
+
+		result_code = write_process_op(&tr, msgp, node, generation);
 	} else {
 		rv = write_local_pickled(keyd, rsvp, pickled_buf, pickled_sz,
-				&rec_props, generation, void_time, node, info, linfo); 
+				&rec_props, generation, void_time, node, info, &linfo); 
 		if (rv == 0) {
 			result_code = AS_PROTO_RESULT_OK;
 		} else {
@@ -5196,6 +5206,8 @@ rw_retransmit_reduce_fn(void *key, uint32_t keylen, void *data, void *udata)
 		// finished
 		if (!wr->shipped_op_initiator) {
 			finished = finish_rw_process_ack(wr, AS_PROTO_RESULT_OK);
+		} else {
+			cf_debug(AS_LDT, "Skipping process ack for LDT ship op initiator");
 		}
 		pthread_mutex_unlock(&wr->lock);
 
@@ -5462,7 +5474,7 @@ as_write_init()
 	}
 
 	rchash_create(&g_write_hash, write_digest_hash, write_request_destructor,
-			sizeof(global_keyd), 16 * 1024, RCHASH_CR_MT_MANYLOCK);
+			sizeof(global_keyd), 32 * 1024, RCHASH_CR_MT_MANYLOCK);
 
 	pthread_create(&g_rw_retransmit_th, 0, rw_retransmit_fn, 0);
 
@@ -5628,188 +5640,149 @@ thr_tsvc_read(as_transaction *tr, as_record_lock *rl, int record_get_rv)
 
 	int rv = record_get_rv;
 
-	// Writes and deletes, which don't need reading, come
-	// in here sometimes. Just try to read when the read bit is set
-	if (m->info1 & AS_MSG_INFO1_READ) {
-		cf_detail(AS_RW, "as_record_get: seeking key %"PRIx64,
-				*(uint64_t *)&tr->keyd);
+	cf_detail(AS_RW, "as_record_get: seeking key %"PRIx64,
+			*(uint64_t *)&tr->keyd);
 
-		if (!r) {
-			if (rv == 0) // we haven't tried to traverse the tree yet
-				rv = as_record_get(tr->rsv.tree, &tr->keyd, r_ref, ns);
+	if (!r) {
+		if (rv == 0) // we haven't tried to traverse the tree yet
+			rv = as_record_get(tr->rsv.tree, &tr->keyd, r_ref, ns);
 
-			MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_tree_hist);
+		MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_tree_hist);
 
-			if (-2 == rv || -3 == rv) {
-				cf_info(AS_RW, "as_record_get failure %d - will retry", rv);
-				return (-1);
-			} else if (-1 == rv) {
-				cf_debug_digest(AS_RW, &(tr->keyd), "[REC NOT FOUND:4]<%s>PID(%u) Pstate(%d):",
-								"thr_tsvc_read()", tr->rsv.pid, tr->rsv.p->state);
-				tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
-			} else { /*0*/
-				r = r_ref->r;
-				as_storage_record_open(ns, r, rd, &tr->keyd);
-				MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_storage_open_hist);
-			}
+		if (-2 == rv || -3 == rv) {
+			cf_info(AS_RW, "as_record_get failure %d - will retry", rv);
+			return (-1);
+		} else if (-1 == rv) {
+			cf_debug_digest(AS_RW, &(tr->keyd), "[REC NOT FOUND:4]<%s>PID(%u) Pstate(%d):",
+							"thr_tsvc_read()", tr->rsv.pid, tr->rsv.p->state);
+			tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
+		} else { /*0*/
+			r = r_ref->r;
+			as_storage_record_open(ns, r, rd, &tr->keyd);
+			MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_storage_open_hist);
 		}
+	}
 
-		// check to see this isn't an expired record waiting to die
-		if (r && r->void_time && r->void_time < as_record_void_time_get()) {
-			cf_debug_digest(AS_RW, &(tr->keyd),
-							"[REC NOT FOUND AND EXPIRED] PartID(%u): expired record still in system, no read",
-							tr->rsv.pid);
+	// check to see this isn't an expired record waiting to die
+	if (r && r->void_time && r->void_time < as_record_void_time_get()) {
+		cf_debug_digest(AS_RW, &(tr->keyd),
+						"[REC NOT FOUND AND EXPIRED] PartID(%u): expired record still in system, no read",
+						tr->rsv.pid);
+		tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
+		as_storage_record_close(r, rd);
+		as_record_done(r_ref, ns);
+		r_ref = 0;
+		r = 0;
+	}
+
+	// Check the key if required.
+	// Note - for data-not-in-memory "exists" ops, key check is expensive!
+	if (r && msg_has_key(m) &&
+			as_storage_record_get_key(rd) && ! check_msg_key(m, rd)) {
+		tr->result_code = AS_PROTO_RESULT_FAIL_KEY_MISMATCH;
+		as_storage_record_close(r, rd);
+		as_record_done(r_ref, ns);
+		r_ref = 0;
+		r = 0;
+	}
+
+	if (r && (m->info1 & AS_MSG_INFO1_GET_NOBINDATA)) {
+		cf_detail(AS_RW, "as_record_get: record exists");
+		tr->result_code = AS_PROTO_RESULT_OK;
+		generation = r->generation;
+		void_time = r->void_time;
+		as_storage_record_close(r, rd);
+		as_record_done(r_ref, ns);
+		r_ref = 0;
+		r = 0;
+	}
+
+	// Build up the response, which is pairs of
+	// as_msg_bin and as_bin.
+	if (r) {
+		rd->n_bins = as_bin_get_n_bins(r, rd);
+
+		if ((m->info1 & AS_MSG_INFO1_GET_ALL)
+				|| (m->info1 & AS_MSG_INFO1_GET_ALL_NODATA))
+			bin_count = rd->n_bins;
+		else
+			bin_count = m->n_ops;
+	}
+
+	as_msg_op *ops[bin_count];
+	as_bin stack_bins[(r && !ns->storage_data_in_memory) ? rd->n_bins : 0];
+
+	if (r) {
+		rd->bins = as_bin_get_all(r, rd, stack_bins);
+
+		if (!as_bin_inuse_has(rd)) {
+			cf_warning(AS_RW, "as_record_get: expired record still in system, no read: n_bins(%d)", rd->n_bins);
+			cf_debug_digest(AS_RW, &(tr->keyd), "[REC NOT FOUND:5] PID(%u) Pstate(%d):",
+							tr->rsv.pid, tr->rsv.p->state);
 			tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
 			as_storage_record_close(r, rd);
 			as_record_done(r_ref, ns);
 			r_ref = 0;
 			r = 0;
 		}
+	}
 
-		// Check the key if required.
-		// Note - for data-not-in-memory "exists" ops, key check is expensive!
-		if (r && msg_has_key(m) &&
-				as_storage_record_get_key(rd) && ! check_msg_key(m, rd)) {
-			tr->result_code = AS_PROTO_RESULT_FAIL_KEY_MISMATCH;
-			as_storage_record_close(r, rd);
-			as_record_done(r_ref, ns);
-			r_ref = 0;
-			r = 0;
+	as_bin *response_bins[bin_count];
+	uint16_t n_bins = 0;
+
+	if (r) {
+		// 'get all' fundamentally different from 'get some'
+		if ((m->info1 & AS_MSG_INFO1_GET_ALL)
+				|| (m->info1 & AS_MSG_INFO1_GET_ALL_NODATA)) {
+			memset(ops, 0, sizeof(as_msg_op *) * rd->n_bins);
+
+			n_bins = as_bin_inuse_count(rd);
+
+			as_bin_get_all_p(rd, response_bins);
 		}
+		// now do the get-some case:
+		// todo: this is an N squared algorithm! Can improve by:
+		// (1) keeping the bins in a sorted list so you can use a binary search
+		// (2) keeping both the bins and the input list sorted, so you can do a simple
+		//     linear scan.
+		// As a reminder; what's happening here is we are filling the output
+		// bins[] array with the pointers from the record.
+		else {
+			as_msg_op *op = 0;
+			int n = 0;
 
-		if (r && (m->info1 & AS_MSG_INFO1_GET_NOBINDATA)) {
-			cf_detail(AS_RW, "as_record_get: record exists");
-			tr->result_code = AS_PROTO_RESULT_OK;
-			generation = r->generation;
-			void_time = r->void_time;
-			as_storage_record_close(r, rd);
-			as_record_done(r_ref, ns);
-			r_ref = 0;
-			r = 0;
-		}
-
-		// Build up the response, which is pairs of
-		// as_msg_bin and as_bin.
-		if (r) {
-			rd->n_bins = as_bin_get_n_bins(r, rd);
-
-			if ((m->info1 & AS_MSG_INFO1_GET_ALL)
-					|| (m->info1 & AS_MSG_INFO1_GET_ALL_NODATA))
-				bin_count = rd->n_bins;
-			else
-				bin_count = m->n_ops;
-		}
-
-		as_msg_op *ops[bin_count];
-		as_bin stack_bins[(r && !ns->storage_data_in_memory) ? rd->n_bins : 0];
-
-		if (r) {
-			rd->bins = as_bin_get_all(r, rd, stack_bins);
-
-			if (!as_bin_inuse_has(rd)) {
-				cf_warning(AS_RW, "as_record_get: expired record still in system, no read: n_bins(%d)", rd->n_bins);
-				cf_debug_digest(AS_RW, &(tr->keyd), "[REC NOT FOUND:5] PID(%u) Pstate(%d):",
-								tr->rsv.pid, tr->rsv.p->state);
-				tr->result_code = AS_PROTO_RESULT_FAIL_NOTFOUND;
-				as_storage_record_close(r, rd);
-				as_record_done(r_ref, ns);
-				r_ref = 0;
-				r = 0;
-			}
-		}
-
-		as_bin *response_bins[bin_count];
-		uint16_t n_bins = 0;
-
-		if (r) {
-			// 'get all' fundamentally different from 'get some'
-			if ((m->info1 & AS_MSG_INFO1_GET_ALL)
-					|| (m->info1 & AS_MSG_INFO1_GET_ALL_NODATA)) {
-				memset(ops, 0, sizeof(as_msg_op *) * rd->n_bins);
-
-				n_bins = as_bin_inuse_count(rd);
-
-				as_bin_get_all_p(rd, response_bins);
-			}
-			// now do the get-some case:
-			// todo: this is an N squared algorithm! Can improve by:
-			// (1) keeping the bins in a sorted list so you can use a binary search
-			// (2) keeping both the bins and the input list sorted, so you can do a simple
-			//     linear scan.
-			// As a reminder; what's happening here is we are filling the output
-			// bins[] array with the pointers from the record.
-			else {
-				as_msg_op *op = 0;
-				int n = 0;
-
-				while ((op = as_msg_op_iterate(m, op, &n))) {
-					if (op->op == AS_MSG_OP_READ) {
-						ops[n_bins] = op;
-						response_bins[n_bins] = as_bin_get(rd, op->name, op->name_sz);
-						n_bins++;
-					}
+			while ((op = as_msg_op_iterate(m, op, &n))) {
+				if (op->op == AS_MSG_OP_READ) {
+					ops[n_bins] = op;
+					response_bins[n_bins] = as_bin_get(rd, op->name, op->name_sz);
+					n_bins++;
 				}
 			}
+		}
 
-			MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_storage_read_hist);
+		MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_storage_read_hist);
 
 #ifdef DEBUG
-			if (bin_counter == 0) {
-				cf_debug(AS_RW, "read: returning no bins, why would a person want that? info %02x r %p", m->info1, r);
-			}
+		if (bin_counter == 0) {
+			cf_debug(AS_RW, "read: returning no bins, why would a person want that? info %02x r %p", m->info1, r);
+		}
 #endif
 
-			generation = r->generation;
-			void_time = r->void_time;
-			set_name = as_index_get_set_name(r, ns);
-		} else {
-			cf_detail(AS_RW, "no value found at this key");
-		}
-
-		cf_debug(AS_RW, "as_record_get: key %"PRIx64" generation %d",
-						*(uint64_t *)&tr->keyd, generation);
-
-		single_transaction_response(tr, ns, ops, response_bins, n_bins,
-				generation, void_time, &written_sz,
-				(m->info1 & AS_MSG_INFO1_XDR) ? (char *) set_name : NULL);
-
-		MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_net_hist);
+		generation = r->generation;
+		void_time = r->void_time;
+		set_name = as_index_get_set_name(r, ns);
+	} else {
+		cf_detail(AS_RW, "no value found at this key");
 	}
-	else {
-		// In case of write request has UDF udf_rw_complete
-		// would reply accordingly
-		if (udf_rw_needcomplete(tr)) {
-			udf_rw_complete(tr, tr->result_code, __FILE__, __LINE__);
-		} else if (tr->proto_fd_h) {
-			cf_debug(AS_RW, "sending reply, fd %d rc %d",
-					tr->proto_fd_h->fd, tr->result_code);
 
-			if (0 != as_msg_send_reply(tr->proto_fd_h, tr->result_code,
-					generation, 0, 0, 0, 0, 0, &written_sz, tr->trid,
-					NULL)) {
+	cf_debug(AS_RW, "as_record_get: key %"PRIx64" generation %d",
+					*(uint64_t *)&tr->keyd, generation);
 
-				cf_debug(AS_RW,
-						"tsvc read: can't send short reply, fd %d rc %d",
-						tr->proto_fd_h->fd, tr->result_code);
-			}
-			cf_hist_track_insert_data_point(g_config.wt_reply_hist,
-					tr->start_time);
-			tr->proto_fd_h = 0;
-		} else if (tr->proxy_msg) {
-			// it was a proxy request - hand it back to the proxy for responding
-			if (tr->flag & AS_TRANSACTION_FLAG_SHIPPED_OP)
-				cf_detail(AS_RW,
-						"[Digest %"PRIx64" Shipped OP] sending reply, rc %d to %"PRIx64"",
-						*(uint64_t *)&tr->keyd, tr->result_code, tr->proxy_node);
-			else
-				cf_detail(AS_RW, "sending proxy reply, rc %d to %"PRIx64"",
-						tr->result_code, tr->proxy_node);
-			as_proxy_send_response(tr->proxy_node, tr->proxy_msg,
-					tr->result_code, 0, 0, 0, 0, 0, 0, tr->trid, NULL);
-		}
+	single_transaction_response(tr, ns, ops, response_bins, n_bins,
+			generation, void_time, &written_sz,
+			(m->info1 & AS_MSG_INFO1_XDR) ? (char *) set_name : NULL);
 
-		MICROBENCHMARK_HIST_INSERT_P(wt_net_hist);
-	}
+	MICROBENCHMARK_HIST_INSERT_AND_RESET_P(rt_net_hist);
 
 	if (tr->result_code != 0)
 		cf_detail(AS_RW, " response with result code %d", tr->result_code);
@@ -5927,12 +5900,6 @@ rw_multi_process(cf_node node, msg *m)
 	cf_atomic_int_incr(&g_config.wprocess_tree_count);
 	reserved = true;
 
-	// Raj (TODO) bailing out like this may be problem
-	ldt_prole_info linfo;
-	if (as_rw_get_ldt_info(&linfo, m, &rsv)) {
-		goto Out;
-	}
-
 	int offset = 0;
 	int count = 0;
 	while (1) {
@@ -5974,7 +5941,7 @@ rw_multi_process(cf_node node, msg *m)
 			cf_detail(AS_RW, "MULTI_OP: Received Sindex multi op");
 		} else {
 			cf_detail(AS_RW, "MULTI_OP: Received LDT multi op");
-			ret = write_process_new(node, op_msg, &rsv, false, &linfo);
+			ret = write_process_new(node, op_msg, &rsv, false);
 		}
 		if (ret) {
 			ret = -3;

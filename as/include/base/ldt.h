@@ -48,6 +48,49 @@
 
 #define LDT_SUB_GC_MAX_RATE         100000 // Do not allow more than 100,000 subrecord GC per second
 
+// Here are the fields (the contents) of the Property Maps.  We've annotated
+// the fields that are used by TopRecords and SubRecords (and both).
+// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#define PM_ItemCount             'I' // (Top): Count of all items in LDT
+#define PM_Version               'V' // (Top): Code Version
+#define PM_LdtType               'T' // (Top): Type: stack, set, map, list
+#define PM_BinName               'B' // (Top): LDT Bin Name
+#define PM_Magic                 'Z' // (All): Special Sauce
+#define PM_EsrDigest             'E' // (All): Digest of ESR
+#define PM_RecType               'R' // (All): Type of Rec:Top,Ldr,Esr,CDir
+#define PM_LogInfo               'L' // (All): Log Info (currently unused)
+#define PM_ParentDigest          'P' // (Subrec): Digest of TopRec
+#define PM_SelfDigest            'D' // (Subrec): Digest of THIS Record
+
+// Here are the fields that are found in the SINGLE "Hidden" LDT Control Map.
+//-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+//-- Record Level Property Map (RPM) Fields: One RPM per record
+//-- ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#define RPM_LdtCount             'C'  // Number of LDTs in this rec
+#define RPM_Version              'V'  // Partition Version Info (6 bytes)
+#define RPM_Magic                'Z'  // Special Sauce
+#define RPM_SelfDigest           'D'  // Digest of this record
+
+#define LF_NextPage              'N'  // Digest of Next (right) Leaf Page
+
+// Here are the fields for Tree Meta Data
+
+#define LS_StoreState            'S'  // Compact or Regular Storage
+
+#define LS_RootKeyList         	 'K'  // Root Key List, when in List Mode
+#define LS_RootDigestList        'D'  // Digest List, when in List Mode
+#define LS_CompactList           'Q'  // Simple Compact List -- before "tree mode"
+#define LS_LeftLeafDigest        'A'  // Record Ptr of Left-most leaf
+#define LS_RightLeafDigest       'Z'  // Record Ptr of Right-most leaf
+
+// Define the LDT Hidden Bin Name -- for any record that contains LDTs
+#define REC_LDT_CTRL_BIN         "LDTCONTROLBIN"
+
+// Define the Property Map Bin Name for Sub Records
+#define SUBREC_PROP_BIN          "SR_PROP_BIN"
+#define LDT_VERSION_SZ           6
+
+
 // Use these flags to designate various LDT bin types -- but they are all
 // HIDDEN BINS.
 #define LDT_FLAG_LDT_BIN 1
@@ -56,8 +99,8 @@
 
 extern cf_clock cf_clock_getabsoluteus();
 
-#define ERR_TOP_REC_NOT_FOUND   2
-#define ERR_NOT_FOUND           125
+#define ERR_TOP_REC_NOT_FOUND    2
+#define ERR_NOT_FOUND            125
 #define ERR_INTERNAL             1400
 #define ERR_UNIQUE_KEY           1402
 #define ERR_INSERT               1403
@@ -90,14 +133,13 @@ extern cf_clock cf_clock_getabsoluteus();
 
 #define ERR_FILTER_BAD           1430
 #define ERR_FILTER_NOT_FOUND     1431
-#define ERR_KEY_FUN_BAD          1432
-#define ERR_KEY_FUN_NOT_FOUND    1433
-#define ERR_TRANS_FUN_BAD        1434
-#define ERR_TRANS_FUN_NOT_FOUND  1435
-#define ERR_UNTRANS_FUN_BAD      1436
-#define ERR_UNTRANS_FUN_NOT_FOUND 1437
-#define ERR_USER_MODULE_BAD       1438
-#define ERR_USER_MODULE_NOT_FOUND 1439
+#define ERR_KEY_BAD              1432
+#define ERR_KEY_FIELD_NOT_FOUND  1433
+#define ERR_INPUT_USER_MODULE_NOT_FOUND 1439
+#define ERR_INPUT_CREATESPEC     1442
+#define ERR_INPUT_TOO_LARGE      1443
+#define ERR_NS_LDT_NOT_ENABLED   1500
+
 
 typedef struct ldt_sub_gc_info_s {
 	as_namespace	*ns;
@@ -251,3 +293,5 @@ as_ldt_string_todigest(const char *bdig, cf_digest *keyd)
 	cf_detail(AS_LDT, "Convert %s to %"PRIx64"", bdig, keyd);
 	return 0;
 }
+
+as_val * as_llist_scan(as_namespace *ns, as_index_tree *sub_tree, as_storage_rd  *rd, as_bin *binp); 

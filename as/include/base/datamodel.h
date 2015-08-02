@@ -79,6 +79,7 @@
 
 #define AS_STORAGE_MAX_DEVICES 32 // maximum devices per namespace
 #define AS_STORAGE_MAX_FILES 32 // maximum files per namespace
+#define AS_STORAGE_MAX_DEVICE_SIZE (2L * 1024L * 1024L * 1024L * 1024L) // 2Tb, due to rblock_id in as_index
 
 #define OBJ_SIZE_HIST_NUM_BUCKETS 100
 #define EVICTION_HIST_NUM_BUCKETS 100
@@ -609,9 +610,8 @@ typedef uint16_t as_partition_id;
 #define AS_PARTITION_STATE_DESYNC  2
 #define AS_PARTITION_STATE_ZOMBIE  3
 #define AS_PARTITION_STATE_WAIT 4
-#define AS_PARTITION_STATE_LIFESUPPORT 5
-#define AS_PARTITION_STATE_ABSENT 6
-#define AS_PARTITION_STATE_JOURNAL_APPLY 7 // used in faked reservations
+#define AS_PARTITION_STATE_ABSENT 5
+#define AS_PARTITION_STATE_JOURNAL_APPLY 6 // used in faked reservations
 typedef uint8_t as_partition_state;
 
 #define AS_PARTITION_MIG_TX_STATE_NONE  0
@@ -648,7 +648,6 @@ struct as_partition_s {
 
 	size_t n_dupl;
 	cf_node  dupl_nodes[AS_CLUSTER_SZ];
-	as_partition_vinfo  dupl_pvinfo[AS_CLUSTER_SZ];
 	bool reject_writes;
 	bool waiting_for_master;
 	cf_node  qnode; 	// point to the node which serves the query at the moment
@@ -723,7 +722,6 @@ typedef struct as_partition_states_s {
 	int		desync;
 	int		zombie;
 	int 	wait;
-	int		lifesupport;
 	int		absent;
 	int		undef;
 	int     n_objects;
@@ -744,6 +742,7 @@ extern cf_node as_partition_getreplica_write(as_namespace *ns, as_partition_id p
 
 // reserve_qnode - *consumes* the ns reservation if success
 extern int as_partition_reserve_qnode(as_namespace *ns, as_partition_id pid, as_partition_reservation *rsv);
+extern void as_partition_prereserve_qnodes(as_namespace * ns, bool is_partition_qnode[], as_partition_reservation rsv[]);
 // reserve_write - *consumes* the ns reservation if success
 extern int as_partition_reserve_write(as_namespace *ns, as_partition_id pid, as_partition_reservation *rsv, cf_node *node, uint64_t *cluster_key);
 // reserve_migrate - *consumes* the ns reservation if success
@@ -766,10 +765,18 @@ extern void as_partition_getreplica_read_str(cf_dyn_buf *db);
 extern void as_partition_getreplica_prole_str(cf_dyn_buf *db);
 extern void as_partition_getreplica_write_str(cf_dyn_buf *db);
 extern void as_partition_getreplica_master_str(cf_dyn_buf *db);
+extern void as_partition_get_replicas_all_str(cf_dyn_buf *db);
 extern void as_partition_getinfo_str(cf_dyn_buf *db);
 extern void as_partition_getstates(as_partition_states *ps);
 
 extern void as_partition_getreplica_write_node(as_namespace *ns, cf_node *node_a);
+
+extern void as_partition_balance();
+extern void as_partition_balance_init();
+extern void as_partition_balance_init_multi_node_cluster();
+extern void as_partition_balance_init_single_node_cluster();
+extern bool as_partition_balance_is_init_resolved();
+extern bool as_partition_balance_is_multi_node_cluster();
 
 typedef struct as_master_prole_stats_s {
 	uint64_t n_master_records;
@@ -876,7 +883,12 @@ typedef struct ns_ldt_stats_s {
 
 	cf_atomic_int	ldt_err_subrec_internal;
 	cf_atomic_int	ldt_err_toprec_internal;
-	cf_atomic_int	ldt_err_transform_internal;
+	cf_atomic_int   ldt_err_filter;
+	cf_atomic_int	ldt_err_key;
+	cf_atomic_int	ldt_err_createspec;
+	cf_atomic_int	ldt_err_usermodule;
+	cf_atomic_int	ldt_err_input_too_large;
+	cf_atomic_int	ldt_err_ldt_not_enabled;
 
 	cf_atomic_int   ldt_gc_io;
 	cf_atomic_int   ldt_gc_cnt;
@@ -923,12 +935,15 @@ struct as_namespace_s {
 	bool						data_in_index;	// with single-bin, allows warm restart for data-in-memory (with storage-engine device)
 	bool 						disallow_null_setname;
 	bool                        ldt_enabled;
+	uint32_t                    ldt_page_size;
 	uint32_t					ldt_gc_sleep_us;
 
 	/* XDR */
 	bool						enable_xdr;
 	bool 						sets_enable_xdr; // namespace-level flag to enable set-based xdr shipping.
 	bool 						ns_forward_xdr_writes; // namespace-level flag to enable forwarding of xdr writes
+	bool 						ns_allow_nonxdr_writes; // namespace-level flag to allow nonxdr writes or not
+	bool 						ns_allow_xdr_writes; // namespace-level flag to allow xdr writes or not
 
 	/* The server default read consistency level for this namespace. */
 	as_policy_consistency_level read_consistency_level;
@@ -949,6 +964,7 @@ struct as_namespace_s {
 	as_storage_type storage_type;
 	char *storage_path;
 	char *storage_devices[AS_STORAGE_MAX_DEVICES];
+	char *storage_shadows[AS_STORAGE_MAX_DEVICES];
 	char *storage_files[AS_STORAGE_MAX_FILES];
 	char *storage_scheduler_mode; // relevant for devices only, not files
 	off_t		storage_filesize;
@@ -1041,7 +1057,7 @@ struct as_namespace_s {
 	struct as_sindex_s	*sindex;  // array with AS_MAX_SINDEX meta data
 	uint64_t			sindex_data_max_memory;
 	cf_atomic_int		sindex_data_memory_used;
-	shash				*sindex_property_hash;  // set_binid_type
+	shash               *sindex_set_binid_hash;
 	shash				*sindex_iname_hash;
 	uint32_t             binid_has_sindex[AS_BINID_HAS_SINDEX_SIZE];
 
